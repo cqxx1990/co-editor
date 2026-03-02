@@ -1,0 +1,33 @@
+{
+  "name": "co-editor",
+  "version": "2.0.0",
+  "description": "多文档协同编辑工具，支持密码保护和管理后台",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "build": "node scripts/pack.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "collaborative",
+    "editor",
+    "realtime",
+    "multi-document",
+    "socket.io"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "better-sqlite3": "^9.0.0",
+    "express": "^4.18.2",
+    "playwright": "^1.58.2",
+    "socket.io": "^4.6.1",
+    "turndown": "^7.2.2"
+  },
+  "devDependencies": {
+    "adm-zip": "^0.5.16",
+    "archiver": "^7.0.1",
+    "tar": "^7.5.9"
+  }
+}

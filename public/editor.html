@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Co-Editor - 编辑</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="container">
+    <header class="header">
+      <h1>📝 Co-Editor</h1>
+      <div class="status-bar">
+        <a href="/" class="btn btn-secondary">← 文档列表</a>
+        <span id="connection-status" class="status offline">离线</span>
+        <span id="users-count" class="users">👥 0 用户</span>
+      </div>
+    </header>
+
+    <!-- 密码输入模态框 -->
+    <div id="password-modal" class="modal" style="display: none;">
+      <div class="modal-content">
+        <h2>🔒 文档需要密码</h2>
+        <p id="doc-id-display"></p>
+        <form id="password-form">
+          <div class="form-group">
+            <label>请输入访问密码</label>
+            <input type="password" id="password-input" placeholder="输入密码" required>
+            <p class="error" id="password-error" style="display: none;">密码错误，请重试</p>
+          </div>
+          <div class="form-actions">
+            <button type="button" class="btn btn-secondary" onclick="window.location.href='/'">返回</button>
+            <button type="submit" class="btn btn-primary">确认</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <main class="editor-container" id="editor-container" style="display: none;">
+      <div id="editor" class="editor" contenteditable="true" placeholder="开始输入..."></div>
+
+      <!-- WebRTC 文件分享区域 -->
+      <section class="file-share" aria-label="文件分享">
+        <div class="file-share__header">
+          <h2 class="file-share__title">📎 文件分享</h2>
+          <div class="file-share__actions">
+            <input id="file-picker" type="file" multiple style="display:none" />
+            <button id="file-pick-btn" class="btn btn-secondary" type="button">选择文件</button>
+          </div>
+        </div>
+        
+        <div class="file-share__info">
+          <p style="margin: 0; color: #666; font-size: 13px;">
+            💡 点对点传输，不经服务器存储。如遇连接问题，请确保网络环境支持WebRTC或尝试刷新页面。
+          </p>
+        </div>
+
+        <div id="file-dropzone" class="file-share__dropzone" tabindex="0">
+          拖拽文件/文件夹到这里进行分享（点对点传输，不经服务器存储）
+        </div>
+
+        <div id="file-list" class="file-share__list"></div>
+      </section>
+    </main>
+
+    <div id="password-overlay" class="password-overlay">
+      <div class="loading">请先输入密码访问文档...</div>
+    </div>
+
+    <footer class="footer">
+      <div id="last-saved" class="last-saved">未保存</div>
+      <div class="info">文档 ID: <span id="current-doc-id"></span></div>
+      <div class="contact">联系方式：624167284@qq.com</div>
+    </footer>
+  </div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="editor.js"></script>
+</body>
+</html>

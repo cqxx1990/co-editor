@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WebRTC 连接测试</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+    
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', sans-serif;
+      background: #f5f5f5;
+      padding: 20px;
+      line-height: 1.6;
+    }
+    
+    .container {
+      max-width: 900px;
+      margin: 0 auto;
+      background: white;
+      padding: 30px;
+      border-radius: 12px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+    }
+    
+    h1 {
+      color: #333;
+      margin-bottom: 10px;
+    }
+    
+    .subtitle {
+      color: #666;
+      margin-bottom: 30px;
+    }
+    
+    .section {
+      margin-bottom: 30px;
+    }
+    
+    .section h2 {
+      color: #2196f3;
+      margin-bottom: 15px;
+      font-size: 18px;
+      border-bottom: 2px solid #2196f3;
+      padding-bottom: 8px;
+    }
+    
+    button {
+      background: #2196f3;
+      color: white;
+      border: none;
+      padding: 12px 24px;
+      border-radius: 6px;
+      font-size: 14px;
+      cursor: pointer;
+      margin-right: 10px;
+      margin-bottom: 10px;
+    }
+    
+    button:hover {
+      background: #1976d2;
+    }
+    
+    button:disabled {
+      background: #ccc;
+      cursor: not-allowed;
+    }
+    
+    .status {
+      margin-top: 15px;
+      padding: 15px;
+      border-radius: 6px;
+      font-family: 'Courier New', monospace;
+      font-size: 13px;
+      background: #f5f5f5;
+    }
+    
+    .status.success {
+      background: #e8f5e9;
+      color: #2e7d32;
+    }
+    
+    .status.error {
+      background: #ffebee;
+      color: #c62828;
+    }
+    
+    .status.info {
+      background: #e3f2fd;
+      color: #1565c0;
+    }
+    
+    .log-entry {
+      margin: 5px 0;
+      padding: 8px;
+      background: #fafafa;
+      border-left: 3px solid #2196f3;
+      border-radius: 3px;
+    }
+    
+    .log-entry.error {
+      border-left-color: #f44336;
+      background: #ffebee;
+    }
+    
+    .log-entry.success {
+      border-left-color: #4caf50;
+      background: #e8f5e9;
+    }
+    
+    .log-entry.warning {
+      border-left-color: #ff9800;
+      background: #fff3e0;
+    }
+    
+    pre {
+      background: #263238;
+      color: #aed581;
+      padding: 15px;
+      border-radius: 6px;
+      overflow-x: auto;
+      font-size: 12px;
+    }
+    
+    .config-display {
+      background: #f5f5f5;
+      padding: 15px;
+      border-radius: 6px;
+      margin-top: 10px;
+    }
+    
+    .candidate-item {
+      padding: 8px;
+      margin: 5px 0;
+      background: white;
+      border: 1px solid #e0e0e0;
+      border-radius: 4px;
+      font-size: 12px;
+    }
+    
+    .candidate-type {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 3px;
+      font-weight: bold;
+      margin-right: 8px;
+      font-size: 11px;
+    }
+    
+    .candidate-type.host { background: #e3f2fd; color: #1565c0; }
+    .candidate-type.srflx { background: #fff3e0; color: #ef6c00; }
+    .candidate-type.relay { background: #e8f5e9; color: #2e7d32; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>🔍 WebRTC 连接测试工具</h1>
+    <p class="subtitle">测试您的网络环境是否支持 WebRTC 文件共享功能并验证 STUN/TURN 服务器配置</p>
+    
+    <div class="section">
+      <h2>当前 STUN/TURN 配置</h2>
+      <div class="config-display">
+        <pre id="config-display"></pre>
+      </div>
+    </div>
+    
+    <div class="section">
+      <h2>ICE 候选收集测试</h2>
+      <p>测试是否能成功收集到各种类型的 ICE 候选（host、srflx、relay）</p>
+      <button id="start-test">开始测试</button>
+      <button id="clear-test">清空结果</button>
+      <div id="test-status"></div>
+      <div id="candidates-list"></div>
+    </div>
+    
+    <div class="section">
+      <h2>诊断建议</h2>
+      <div id="diagnostic-info" class="status info">
+        点击"开始测试"来诊断您的网络环境...
+      </div>
+    </div>
+    
+    <div class="section">
+      <h2>测试日志</h2>
+      <div id="test-logs"></div>
+    </div>
+  </div>
+
+  <script>
+    const RTC_CONFIG = {
+      iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
+        { urls: 'stun:stun2.l.google.com:19302' },
+        {
+          urls: 'turn:openrelay.metered.ca:80',
+          username: 'openrelayproject',
+          credential: 'openrelayproject'
+        },
+        {
+          urls: 'turn:openrelay.metered.ca:443',
+          username: 'openrelayproject',
+          credential: 'openrelayproject'
+        },
+        {
+          urls: 'turn:openrelay.metered.ca:443?transport=tcp',
+          username: 'openrelayproject',
+          credential: 'openrelayproject'
+        }
+      ],
+      iceTransportPolicy: 'all',
+      iceCandidatePoolSize: 10
+    };
+
+    let pc = null;
+    const candidates = {
+      host: [],
+      srflx: [],
+      relay: []
+    };
+
+    // 显示配置
+    document.getElementById('config-display').textContent = JSON.stringify(RTC_CONFIG, null, 2);
+
+    function log(message, type = 'info') {
+      const logsDiv = document.getElementById('test-logs');
+      const entry = document.createElement('div');
+      entry.className = `log-entry ${type}`;
+      entry.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
+      logsDiv.insertBefore(entry, logsDiv.firstChild);
+    }
+
+    function updateStatus(message, type = 'info') {
+      const statusDiv = document.getElementById('test-status');
+      statusDiv.className = `status ${type}`;
+      statusDiv.textContent = message;
+    }
+
+    function displayCandidate(candidate) {
+      const listDiv = document.getElementById('candidates-list');
+      const item = document.createElement('div');
+      item.className = 'candidate-item';
+      
+      const type = candidate.type;
+      const typeSpan = document.createElement('span');
+      typeSpan.className = `candidate-type ${type}`;
+      typeSpan.textContent = type.toUpperCase();
+      
+      const info = document.createElement('span');
+      info.textContent = ` ${candidate.address || candidate.ip || 'N/A'}:${candidate.port || 'N/A'} (${candidate.protocol || 'N/A'})`;
+      
+      item.appendChild(typeSpan);
+      item.appendChild(info);
+      listDiv.appendChild(item);
+    }
+
+    function analyzeCandidates() {
+      const diagnosticDiv = document.getElementById('diagnostic-info');
+      const hasHost = candidates.host.length > 0;
+      const hasSrflx = candidates.srflx.length > 0;
+      const hasRelay = candidates.relay.length > 0;
+
+      let diagnostic = '';
+      let type = 'info';
+
+      if (hasRelay) {
+        diagnostic = '✅ 网络配置良好！\n\n';
+        diagnostic += `• Host 候选: ${candidates.host.length} 个（本地直连）\n`;
+        diagnostic += `• Srflx 候选: ${candidates.srflx.length} 个（STUN 穿透）\n`;
+        diagnostic += `• Relay 候选: ${candidates.relay.length} 个（TURN 中继）✓\n\n`;
+        diagnostic += '您的网络环境支持所有连接方式，文件共享功能应该能够正常工作。';
+        type = 'success';
+      } else if (hasSrflx) {
+        diagnostic = '⚠️ 网络配置一般\n\n';
+        diagnostic += `• Host 候选: ${candidates.host.length} 个（本地直连）\n`;
+        diagnostic += `• Srflx 候选: ${candidates.srflx.length} 个（STUN 穿透）\n`;
+        diagnostic += `• Relay 候选: ${candidates.relay.length} 个（TURN 中继）✗\n\n`;
+        diagnostic += '无法连接到 TURN 服务器！\n';
+        diagnostic += '在简单 NAT 环境下可能工作，但在严格防火墙后可能失败。\n\n';
+        diagnostic += '建议：\n';
+        diagnostic += '1. 检查 TURN 服务器配置是否正确\n';
+        diagnostic += '2. 确认防火墙没有阻止 TURN 端口\n';
+        diagnostic += '3. 考虑使用其他 TURN 服务提供商';
+        type = 'error';
+      } else if (hasHost) {
+        diagnostic = '❌ 网络受限\n\n';
+        diagnostic += `• Host 候选: ${candidates.host.length} 个（本地直连）\n`;
+        diagnostic += `• Srflx 候选: ${candidates.srflx.length} 个（STUN 穿透）✗\n`;
+        diagnostic += `• Relay 候选: ${candidates.relay.length} 个（TURN 中继）✗\n\n`;
+        diagnostic += '无法连接到 STUN 和 TURN 服务器！\n';
+        diagnostic += '只能在同一局域网内工作，外网环境无法使用。\n\n';
+        diagnostic += '可能原因：\n';
+        diagnostic += '1. 防火墙阻止了 UDP 流量\n';
+        diagnostic += '2. 网络严格限制出站连接\n';
+        diagnostic += '3. 代理服务器阻止了 WebRTC\n\n';
+        diagnostic += '建议：联系网络管理员或更换网络环境';
+        type = 'error';
+      } else {
+        diagnostic = '❌ 无法收集 ICE 候选\n\n';
+        diagnostic += '浏览器可能不支持 WebRTC 或网络配置有严重问题。';
+        type = 'error';
+      }
+
+      diagnosticDiv.className = `status ${type}`;
+      diagnosticDiv.style.whiteSpace = 'pre-wrap';
+      diagnosticDiv.textContent = diagnostic;
+    }
+
+    async function startTest() {
+      const startBtn = document.getElementById('start-test');
+      startBtn.disabled = true;
+      
+      // 清空之前的结果
+      candidates.host = [];
+      candidates.srflx = [];
+      candidates.relay = [];
+      document.getElementById('candidates-list').innerHTML = '';
+      document.getElementById('test-logs').innerHTML = '';
+
+      log('开始测试...', 'info');
+      updateStatus('正在收集 ICE 候选，请稍候（最多需要 30 秒）...', 'info');
+
+      try {
+        pc = new RTCPeerConnection(RTC_CONFIG);
+        log('创建 RTCPeerConnection 成功', 'success');
+
+        // 创建 data channel 来触发 ICE 收集
+        const dc = pc.createDataChannel('test');
+        log('创建 Data Channel', 'success');
+
+        pc.onicecandidate = (event) => {
+          if (event.candidate) {
+            const c = event.candidate;
+            log(`收集到候选: ${c.type} - ${c.address}:${c.port}`, 'success');
+            
+            if (c.type === 'host') {
+              candidates.host.push(c);
+            } else if (c.type === 'srflx') {
+              candidates.srflx.push(c);
+            } else if (c.type === 'relay') {
+              candidates.relay.push(c);
+            }
+            
+            displayCandidate(c);
+          } else {
+            log('ICE 候选收集完成', 'success');
+            updateStatus(`收集完成！共收集到 ${candidates.host.length + candidates.srflx.length + candidates.relay.length} 个候选`, 'success');
+            analyzeCandidates();
+            startBtn.disabled = false;
+          }
+        };
+
+        pc.onicegatheringstatechange = () => {
+          log(`ICE gathering state: ${pc.iceGatheringState}`, 'info');
+        };
+
+        pc.oniceconnectionstatechange = () => {
+          log(`ICE connection state: ${pc.iceConnectionState}`, 'info');
+        };
+
+        // 创建 offer 来启动 ICE 收集
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        log('创建 Offer 并设置本地描述', 'success');
+
+        // 设置超时
+        setTimeout(() => {
+          if (pc && pc.iceGatheringState !== 'complete') {
+            log('ICE 收集超时！', 'error');
+            updateStatus('收集超时，可能网络环境有问题', 'error');
+            analyzeCandidates();
+            startBtn.disabled = false;
+          }
+        }, 30000);
+
+      } catch (error) {
+        log(`错误: ${error.message}`, 'error');
+        updateStatus(`测试失败: ${error.message}`, 'error');
+        startBtn.disabled = false;
+      }
+    }
+
+    function clearTest() {
+      if (pc) {
+        pc.close();
+        pc = null;
+      }
+      
+      candidates.host = [];
+      candidates.srflx = [];
+      candidates.relay = [];
+      
+      document.getElementById('candidates-list').innerHTML = '';
+      document.getElementById('test-logs').innerHTML = '';
+      document.getElementById('test-status').innerHTML = '';
+      document.getElementById('diagnostic-info').className = 'status info';
+      document.getElementById('diagnostic-info').style.whiteSpace = 'normal';
+      document.getElementById('diagnostic-info').textContent = '点击"开始测试"来诊断您的网络环境...';
+      
+      document.getElementById('start-test').disabled = false;
+    }
+
+    document.getElementById('start-test').addEventListener('click', startTest);
+    document.getElementById('clear-test').addEventListener('click', clearTest);
+  </script>
+</body>
+</html>

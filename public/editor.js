@@ -1,0 +1,1193 @@
+// editor.js - 编辑器逻辑
+
+// =============================
+// TURN 服务器配置（部署时修改此处）
+// =============================
+const TURN_SERVER = 'your-server.com'; // 修改为你的服务器域名或 IP
+const TURN_USER = 'coeditor';
+const TURN_PASSWORD = 'turn2024pass';
+
+const socket = io();
+const editor = document.getElementById('editor');
+const connectionStatus = document.getElementById('connection-status');
+const usersCount = document.getElementById('users-count');
+const lastSaved = document.getElementById('last-saved');
+const currentDocIdSpan = document.getElementById('current-doc-id');
+
+// 从 URL 获取文档 ID
+const docId = window.location.hash.slice(1) || '';
+let currentRoom = null;
+
+if (!docId) {
+  window.location.href = '/';
+} else {
+  currentDocIdSpan.textContent = docId;
+}
+
+// 状态
+const state = {
+  isComposing: false,
+  lastContent: '',
+  throttleDelay: 300,
+  throttleTimer: null,
+  password: null
+};
+
+// =============================
+// WebRTC 文件分享
+// =============================
+const fileDropzone = document.getElementById('file-dropzone');
+const fileListEl = document.getElementById('file-list');
+const filePicker = document.getElementById('file-picker');
+const filePickBtn = document.getElementById('file-pick-btn');
+
+// server 侧共享列表（元数据）
+const sharedFiles = new Map(); // fileId -> meta
+
+// 本机实际文件（仅拥有者保存，用于发送）
+const localFiles = new Map(); // fileId -> File
+const pendingLocalAdds = new Map(); // clientTempId -> File
+
+// WebRTC 会话：key = `${fileId}:${peerSocketId}`
+const rtcSessions = new Map();
+
+const RTC_CONFIG = {
+  iceServers: [
+    // STUN 服务器（用于 NAT 穿透）
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'stun:stun2.l.google.com:19302' },
+    // 自建 TURN 服务器（优先级最高）
+    {
+      urls: `turn:${TURN_SERVER}:3478`,
+      username: TURN_USER,
+      credential: TURN_PASSWORD
+    },
+    {
+      urls: `turn:${TURN_SERVER}:3478?transport=tcp`,
+      username: TURN_USER,
+      credential: TURN_PASSWORD
+    },
+    // 免费备用 TURN 服务器（当自建服务器不可用时）
+    {
+      urls: 'turn:openrelay.metered.ca:80',
+      username: 'openrelayproject',
+      credential: 'openrelayproject'
+    },
+    {
+      urls: 'turn:openrelay.metered.ca:443',
+      username: 'openrelayproject',
+      credential: 'openrelayproject'
+    },
+    {
+      urls: 'turn:openrelay.metered.ca:443?transport=tcp',
+      username: 'openrelayproject',
+      credential: 'openrelayproject'
+    }
+  ],
+  iceTransportPolicy: 'all', // 尝试所有可用的连接方式
+  iceCandidatePoolSize: 10 // 预先收集候选
+};
+
+function formatBytes(bytes) {
+  if (typeof bytes !== 'number' || Number.isNaN(bytes)) return '';
+  const units = ['B', 'KB', 'MB', 'GB'];
+  let v = bytes;
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i++;
+  }
+  const fixed = i === 0 ? 0 : (v < 10 ? 2 : 1);
+  return `${v.toFixed(fixed)} ${units[i]}`;
+}
+
+function ensureFileShareUI() {
+  if (!fileDropzone || !fileListEl) return;
+
+  // 文件选择
+  if (filePickBtn && filePicker) {
+    filePickBtn.addEventListener('click', () => filePicker.click());
+    filePicker.addEventListener('change', async (e) => {
+      const files = Array.from(e.target.files || []);
+      filePicker.value = '';
+      if (files.length) await shareFiles(files);
+    });
+  }
+
+  // Drag & drop
+  const setDrag = (on) => {
+    fileDropzone.classList.toggle('dragover', !!on);
+  };
+
+  fileDropzone.addEventListener('dragover', (e) => {
+    e.preventDefault();
+    setDrag(true);
+  });
+  fileDropzone.addEventListener('dragleave', () => setDrag(false));
+  fileDropzone.addEventListener('drop', async (e) => {
+    e.preventDefault();
+    setDrag(false);
+
+    const files = await extractFilesFromDataTransfer(e.dataTransfer);
+    if (files.length) await shareFiles(files);
+  });
+}
+
+async function extractFilesFromDataTransfer(dt) {
+  if (!dt) return [];
+
+  // 支持文件夹拖拽（Chromium / WebKit）
+  const items = Array.from(dt.items || []);
+  const hasEntries = items.some((it) => typeof it.webkitGetAsEntry === 'function');
+
+  if (!hasEntries) {
+    return Array.from(dt.files || []);
+  }
+
+  const out = [];
+
+  const walkEntry = async (entry, prefix = '') => {
+    if (!entry) return;
+
+    if (entry.isFile) {
+      await new Promise((resolve) => {
+        entry.file((file) => {
+          const wrapped = new File([file], `${prefix}${file.name}`, { type: file.type });
+          out.push(wrapped);
+          resolve();
+        }, resolve);
+      });
+      return;
+    }
+
+    if (entry.isDirectory) {
+      const reader = entry.createReader();
+      const readBatch = async () => {
+        const entries = await new Promise((resolve) => reader.readEntries(resolve));
+        if (!entries || !entries.length) return;
+        for (const child of entries) {
+          await walkEntry(child, `${prefix}${entry.name}/`);
+        }
+        await readBatch();
+      };
+      await readBatch();
+    }
+  };
+
+  for (const item of items) {
+    const entry = item.webkitGetAsEntry && item.webkitGetAsEntry();
+    if (entry) await walkEntry(entry, '');
+  }
+
+  // fallback: 兜底补充 dt.files
+  for (const f of Array.from(dt.files || [])) {
+    if (!out.some((x) => x.name === f.name && x.size === f.size)) out.push(f);
+  }
+
+  return out;
+}
+
+async function shareFiles(files) {
+  if (!socket || !socket.connected) {
+    alert('未连接服务器，无法分享文件');
+    return;
+  }
+
+  for (const file of files) {
+    // 为本地保存建立临时关联，等待 server 分配 fileId
+    const clientTempId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    pendingLocalAdds.set(clientTempId, file);
+
+    socket.emit('file-share-add', {
+      name: file.name,
+      size: file.size,
+      mime: file.type || 'application/octet-stream',
+      ownerUserLabel: '我',
+      clientTempId
+    });
+  }
+}
+
+function renderSharedFiles() {
+  if (!fileListEl) return;
+
+  const files = Array.from(sharedFiles.values()).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+  if (!files.length) {
+    fileListEl.innerHTML = '<div class="loading" style="padding: 10px;">暂无共享文件</div>';
+    return;
+  }
+
+  fileListEl.innerHTML = files.map((f) => {
+    const isOwner = f.ownerSocketId === socket.id;
+    const ownerLabel = isOwner ? '我' : (f.ownerUserLabel || f.ownerSocketId.slice(0, 6));
+    return `
+      <div class="file-item" data-file-id="${f.fileId}">
+        <div class="file-item__meta">
+          <div class="file-item__name" title="${escapeHtml(f.name)}">${escapeHtml(f.name)}</div>
+          <div class="file-item__sub">
+            <span>大小: ${formatBytes(f.size)}</span>
+            <span>来源: ${escapeHtml(ownerLabel)}</span>
+          </div>
+          <div class="progress" style="display:none"><div></div></div>
+          <div class="file-item__sub file-item__status" style="display:none"></div>
+        </div>
+        <div class="file-item__actions">
+          ${isOwner ? `<button class="btn btn-danger" data-action="remove">移除</button>` : `<button class="btn btn-primary" data-action="download">下载</button>`}
+        </div>
+      </div>
+    `;
+  }).join('');
+
+  // bind actions
+  fileListEl.querySelectorAll('[data-action="remove"]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const fileId = btn.closest('.file-item')?.dataset?.fileId;
+      if (!fileId) return;
+      socket.emit('file-share-remove', { fileId });
+    });
+  });
+
+  fileListEl.querySelectorAll('[data-action="download"]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const fileId = btn.closest('.file-item')?.dataset?.fileId;
+      if (!fileId) return;
+      const meta = sharedFiles.get(fileId);
+      if (!meta) return;
+      await startDownload(meta);
+    });
+  });
+}
+
+function escapeHtml(s) {
+  return String(s || '')
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+}
+
+function getFileItemEls(fileId) {
+  const item = fileListEl?.querySelector(`.file-item[data-file-id="${fileId}"]`);
+  if (!item) return {};
+  return {
+    item,
+    progressWrap: item.querySelector('.progress'),
+    progressBar: item.querySelector('.progress > div'),
+    status: item.querySelector('.file-item__status')
+  };
+}
+
+function setFileStatus(fileId, text, progress01 = null) {
+  const { progressWrap, progressBar, status } = getFileItemEls(fileId);
+  if (status) {
+    status.style.display = text ? 'flex' : 'none';
+    status.textContent = text || '';
+  }
+  if (progressWrap && progressBar) {
+    const show = typeof progress01 === 'number';
+    progressWrap.style.display = show ? 'block' : 'none';
+    if (show) progressBar.style.width = `${Math.max(0, Math.min(1, progress01)) * 100}%`;
+  }
+}
+
+function sessionKey(fileId, peer) {
+  return `${fileId}:${peer}`;
+}
+
+function cleanupSession(key) {
+  const session = rtcSessions.get(key);
+  if (!session) return;
+  
+  console.log(`[WebRTC] Cleaning up session: ${key}`);
+  
+  if (session.dc) {
+    try {
+      session.dc.close();
+    } catch (e) {
+      console.error('Error closing data channel:', e);
+    }
+  }
+  
+  if (session.pc) {
+    try {
+      session.pc.close();
+    } catch (e) {
+      console.error('Error closing peer connection:', e);
+    }
+  }
+  
+  rtcSessions.delete(key);
+}
+
+function createPeerConnection(fileId, peerSocketId, role) {
+  const key = sessionKey(fileId, peerSocketId);
+
+  const pc = new RTCPeerConnection(RTC_CONFIG);
+  const session = {
+    key,
+    fileId,
+    peerSocketId,
+    role,
+    pc,
+    dc: null,
+    recv: {
+      expectedSize: null,
+      received: 0,
+      chunks: [],
+      mime: 'application/octet-stream',
+      name: 'download'
+    }
+  };
+
+  pc.onicecandidate = (e) => {
+    if (e.candidate) {
+      console.log(`[WebRTC] ICE candidate for ${fileId}:`, e.candidate.type);
+      socket.emit('webrtc-signal', {
+        to: peerSocketId,
+        fileId,
+        data: { type: 'ice', candidate: e.candidate }
+      });
+    } else {
+      console.log(`[WebRTC] ICE gathering complete for ${fileId}`);
+    }
+  };
+
+  pc.onicegatheringstatechange = () => {
+    console.log(`[WebRTC] ICE gathering state for ${fileId}:`, pc.iceGatheringState);
+    if (pc.iceGatheringState === 'complete') {
+      console.log(`[WebRTC] ICE gathering completed for ${fileId}`);
+    }
+  };
+
+  pc.oniceconnectionstatechange = () => {
+    console.log(`[WebRTC] ICE connection state for ${fileId}:`, pc.iceConnectionState);
+    if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'disconnected') {
+      setFileStatus(fileId, '连接失败，请重试', null);
+      setTimeout(() => cleanupSession(key), 3000);
+    } else if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+      console.log(`[WebRTC] Connection established for ${fileId}`);
+    }
+  };
+
+  pc.onconnectionstatechange = () => {
+    console.log(`[WebRTC] Connection state for ${fileId}:`, pc.connectionState);
+    if (pc.connectionState === 'failed') {
+      setFileStatus(fileId, '连接失败，请检查网络', null);
+      setTimeout(() => cleanupSession(key), 3000);
+    } else if (pc.connectionState === 'disconnected') {
+      setFileStatus(fileId, '连接已断开', null);
+      setTimeout(() => cleanupSession(key), 3000);
+    }
+  };
+
+  rtcSessions.set(key, session);
+  return session;
+}
+
+async function startDownload(meta) {
+  const fileId = meta.fileId;
+  const owner = meta.ownerSocketId;
+  if (!owner) {
+    alert('缺少文件拥有者信息');
+    return;
+  }
+
+  setFileStatus(fileId, '正在建立连接...', 0);
+  console.log(`[WebRTC] Starting download for file: ${fileId}`);
+  console.log(`[WebRTC] Connecting to owner: ${owner}`);
+
+  const session = createPeerConnection(fileId, owner, 'downloader');
+  const { pc } = session;
+
+  // 设置连接超时（60秒，给 TURN 服务器更多时间）
+  const timeoutId = setTimeout(() => {
+    // 检查连接是否成功建立
+    const isConnected = pc.iceConnectionState === 'connected' || 
+                       pc.iceConnectionState === 'completed' ||
+                       (session.dc && session.dc.readyState === 'open');
+    
+    if (!isConnected) {
+      console.error(`[WebRTC] Connection timeout for file: ${fileId}`);
+      console.error(`[WebRTC] Final states - ICE: ${pc.iceConnectionState}, Connection: ${pc.connectionState}, ICE Gathering: ${pc.iceGatheringState}`);
+      
+      let errorMsg = '连接超时';
+      if (pc.iceGatheringState !== 'complete') {
+        errorMsg = '网络不稳定，无法收集连接信息';
+      } else if (pc.iceConnectionState === 'failed') {
+        errorMsg = '连接失败，可能需要 TURN 服务器支持';
+      } else {
+        errorMsg = '连接超时，请检查网络或尝试刷新页面';
+      }
+      
+      setFileStatus(fileId, errorMsg, null);
+      cleanupSession(sessionKey(fileId, owner));
+      
+      // 提示用户可能的解决方案
+      console.warn('[WebRTC] 连接失败可能的原因：');
+      console.warn('1. 双方都在严格的 NAT/防火墙后');
+      console.warn('2. TURN 服务器不可用或配置错误');
+      console.warn('3. 网络不稳定');
+      console.warn('建议：尝试刷新页面或检查 TURN 服务器配置');
+    }
+  }, 60000); // 延长到 60 秒
+  
+  session.timeoutId = timeoutId;
+  session.connectionStartTime = Date.now();
+
+  // downloader 创建 datachannel
+  const dc = pc.createDataChannel(`file:${fileId}`, { ordered: true });
+  session.dc = dc;
+  wireDownloaderDataChannel(session);
+
+  try {
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+
+    console.log(`[WebRTC] Sending offer for ${fileId}`);
+    socket.emit('webrtc-signal', {
+      to: owner,
+      fileId,
+      data: { type: 'offer', sdp: pc.localDescription }
+    });
+  } catch (error) {
+    console.error(`[WebRTC] Error creating offer:`, error);
+    setFileStatus(fileId, '连接失败：' + error.message, null);
+    clearTimeout(timeoutId);
+    cleanupSession(sessionKey(fileId, owner));
+  }
+}
+
+function wireDownloaderDataChannel(session) {
+  const { dc, fileId } = session;
+  if (!dc) return;
+
+  dc.binaryType = 'arraybuffer';
+
+  dc.onopen = () => {
+    const elapsed = session.connectionStartTime ? Date.now() - session.connectionStartTime : 0;
+    console.log(`[WebRTC] Data channel opened for ${fileId} (耗时: ${Math.round(elapsed/1000)}秒)`);
+    setFileStatus(fileId, '连接已建立，等待传输...', 0);
+    
+    // 清除超时定时器
+    if (session.timeoutId) {
+      clearTimeout(session.timeoutId);
+      session.timeoutId = null;
+    }
+    
+    // 记录连接类型（帮助诊断）
+    setTimeout(() => {
+      session.pc.getStats().then(stats => {
+        stats.forEach(report => {
+          if (report.type === 'candidate-pair' && report.state === 'succeeded') {
+            const localCandidate = stats.get(report.localCandidateId);
+            const remoteCandidate = stats.get(report.remoteCandidateId);
+            if (localCandidate && remoteCandidate) {
+              console.log(`[WebRTC] Connection type: ${localCandidate.candidateType} -> ${remoteCandidate.candidateType}`);
+              if (localCandidate.candidateType === 'relay' || remoteCandidate.candidateType === 'relay') {
+                console.log('[WebRTC] 使用 TURN 中继连接');
+              } else if (localCandidate.candidateType === 'srflx' || remoteCandidate.candidateType === 'srflx') {
+                console.log('[WebRTC] 使用 STUN 穿透连接');
+              } else {
+                console.log('[WebRTC] 使用直接连接');
+              }
+            }
+          }
+        });
+      }).catch(e => console.warn('[WebRTC] 无法获取连接统计:', e));
+    }, 1000);
+  };
+  
+  dc.onerror = (error) => {
+    console.error(`[WebRTC] Data channel error for ${fileId}:`, error);
+    setFileStatus(fileId, '数据通道错误', null);
+  };
+  
+  dc.onclose = () => {
+    console.log(`[WebRTC] Data channel closed for ${fileId}`);
+  };
+
+  dc.onmessage = (ev) => {
+    if (typeof ev.data === 'string') {
+      try {
+        const msg = JSON.parse(ev.data);
+        if (msg.type === 'meta') {
+          session.recv.expectedSize = msg.size;
+          session.recv.mime = msg.mime || 'application/octet-stream';
+          session.recv.name = msg.name || 'download';
+          setFileStatus(fileId, `开始接收：0 / ${formatBytes(msg.size)}`, 0);
+        } else if (msg.type === 'done') {
+          finalizeDownload(session);
+        }
+      } catch {
+        // ignore
+      }
+      return;
+    }
+
+    // binary
+    const buf = ev.data;
+    if (buf && buf.byteLength) {
+      session.recv.chunks.push(buf);
+      session.recv.received += buf.byteLength;
+
+      const total = session.recv.expectedSize || 0;
+      const p = total ? (session.recv.received / total) : null;
+      setFileStatus(fileId, `接收中：${formatBytes(session.recv.received)} / ${formatBytes(total)}`, p);
+
+      if (total && session.recv.received >= total) {
+        finalizeDownload(session);
+      }
+    }
+  };
+}
+
+function finalizeDownload(session) {
+  const { fileId, dc, pc } = session;
+  const { chunks, mime, name, expectedSize } = session.recv;
+
+  console.log(`[WebRTC] Finalizing download for ${fileId}`);
+  
+  const blob = new Blob(chunks, { type: mime || 'application/octet-stream' });
+  const url = URL.createObjectURL(blob);
+
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = name || `file-${fileId}`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+
+  setFileStatus(fileId, `下载完成：${formatBytes(expectedSize || blob.size)}`, 1);
+
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
+
+  // 清理资源
+  if (session.timeoutId) {
+    clearTimeout(session.timeoutId);
+  }
+  
+  try { dc && dc.close(); } catch {}
+  try { pc && pc.close(); } catch {}
+  rtcSessions.delete(session.key);
+}
+
+function wireUploaderDataChannel(session) {
+  const { fileId, peerSocketId, dc } = session;
+
+  dc.binaryType = 'arraybuffer';
+  
+  dc.onerror = (error) => {
+    console.error(`[WebRTC] Uploader data channel error for ${fileId}:`, error);
+    setFileStatus(fileId, '发送错误', null);
+  };
+  
+  dc.onclose = () => {
+    console.log(`[WebRTC] Uploader data channel closed for ${fileId}`);
+  };
+
+  dc.onopen = async () => {
+    const elapsed = session.connectionStartTime ? Date.now() - session.connectionStartTime : 0;
+    console.log(`[WebRTC] Uploader data channel opened for ${fileId} (耗时: ${Math.round(elapsed/1000)}秒)`);
+    
+    // 清除超时定时器（如果有）
+    if (session.timeoutId) {
+      clearTimeout(session.timeoutId);
+      session.timeoutId = null;
+    }
+    
+    const file = localFiles.get(fileId);
+    if (!file) {
+      console.error(`[WebRTC] Local file missing for ${fileId}`);
+      setFileStatus(fileId, '本机文件缺失，无法发送', null);
+      try { dc.close(); } catch {}
+      return;
+    }
+
+    try {
+      // 先发 meta
+      dc.send(JSON.stringify({
+        type: 'meta',
+        name: file.name,
+        size: file.size,
+        mime: file.type || 'application/octet-stream'
+      }));
+
+      // 分片发送
+      const chunkSize = 64 * 1024;
+      let offset = 0;
+
+      setFileStatus(fileId, `发送给 ${peerSocketId.slice(0, 6)}：0 / ${formatBytes(file.size)}`, 0);
+
+      while (offset < file.size) {
+        const slice = file.slice(offset, offset + chunkSize);
+        const buf = await slice.arrayBuffer();
+
+        // 简单流控：避免 send buffer 堵塞
+        while (dc.bufferedAmount > 4 * 1024 * 1024) {
+          await new Promise((r) => setTimeout(r, 50));
+        }
+
+        dc.send(buf);
+        offset += buf.byteLength;
+        setFileStatus(fileId, `发送给 ${peerSocketId.slice(0, 6)}：${formatBytes(offset)} / ${formatBytes(file.size)}`, offset / file.size);
+      }
+
+      dc.send(JSON.stringify({ type: 'done' }));
+      console.log(`[WebRTC] File transfer complete for ${fileId}`);
+      setFileStatus(fileId, `发送完成：${formatBytes(file.size)}`, 1);
+      
+      // 延迟关闭，确保对方收到 done 消息
+      setTimeout(() => {
+        try { dc.close(); } catch {}
+      }, 1000);
+    } catch (error) {
+      console.error(`[WebRTC] Error during file transfer:`, error);
+      setFileStatus(fileId, `发送失败：${error.message}`, null);
+      try { dc.close(); } catch {}
+    }
+  };
+}
+
+// 尝试从 sessionStorage 获取密码
+const savedPassword = sessionStorage.getItem(`doc-password-${docId}`);
+
+// 不立即加入文档，等待 socket 连接成功后再加入
+if (savedPassword) {
+  state.password = savedPassword;
+}
+
+// 加入文档函数
+function joinDocument(docId, password) {
+  console.log('📄 加入文档:', docId, password ? '(有密码)' : '(无密码)');
+  socket.emit('join-document', { docId, password });
+}
+
+// Socket.io 事件处理
+socket.on('connect', () => {
+  console.log('✅ 已连接到服务器');
+  updateConnectionStatus(true);
+
+  // 连接成功后加入文档
+  if (state.password) {
+    joinDocument(docId, state.password);
+  } else {
+    joinDocument(docId, '');
+  }
+});
+
+socket.on('disconnect', () => {
+  console.log('❌ 与服务器断开连接');
+  updateConnectionStatus(false);
+});
+
+// Socket.IO v4 重连事件在 socket.io 管理器上触发
+if (socket.io) {
+  socket.io.on('reconnect_attempt', (attemptNumber) => {
+    console.log(`🔄 重连中... (${attemptNumber})`);
+    connectionStatus.textContent = `重连中 (${attemptNumber})`;
+    connectionStatus.className = 'status offline';
+  });
+
+  socket.io.on('reconnect', () => {
+    console.log('✅ 重连成功');
+    if (currentRoom) {
+      socket.emit('sync-request');
+    }
+  });
+}
+
+// 兼容旧事件名（如果服务端有自定义转发）
+socket.on('io-reconnect_attempt', (attemptNumber) => {
+  console.log(`🔄 重连中... (${attemptNumber})`);
+  connectionStatus.textContent = `重连中 (${attemptNumber})`;
+  connectionStatus.className = 'status offline';
+});
+
+socket.on('io-reconnect', () => {
+  console.log('✅ 重连成功');
+  if (currentRoom) {
+    socket.emit('sync-request');
+  }
+});
+
+socket.on('init', (data) => {
+  console.log('📥 收到初始内容');
+  showEditor();
+  setEditorContent(data.content);
+  state.lastContent = data.content;
+  updateUsersCount(data.usersCount);
+
+  // 初始化文件分享 UI（需要等 editor 显示后）
+  ensureFileShareUI();
+});
+
+// 文件分享：全量列表
+socket.on('file-share-list', (payload) => {
+  sharedFiles.clear();
+  for (const f of (payload?.files || [])) {
+    if (f?.fileId) sharedFiles.set(f.fileId, f);
+  }
+  renderSharedFiles();
+});
+
+// 文件分享：新增
+socket.on('file-share-added', (meta) => {
+  if (!meta?.fileId) return;
+  sharedFiles.set(meta.fileId, meta);
+
+  // 如果是我分享的文件，尝试把 fileId 与本地 File 绑定起来
+  if (meta.ownerSocketId === socket.id && meta.clientTempId && pendingLocalAdds.has(meta.clientTempId)) {
+    const file = pendingLocalAdds.get(meta.clientTempId);
+    pendingLocalAdds.delete(meta.clientTempId);
+    if (file) localFiles.set(meta.fileId, file);
+  }
+
+  renderSharedFiles();
+});
+
+socket.on('file-share-removed', ({ fileId }) => {
+  if (!fileId) return;
+  sharedFiles.delete(fileId);
+  localFiles.delete(fileId);
+  renderSharedFiles();
+});
+
+// WebRTC 信令
+socket.on('webrtc-signal', async (payload) => {
+  const { from, fileId, data } = payload || {};
+  if (!from || !fileId || !data) return;
+
+  const key = sessionKey(fileId, from);
+
+  try {
+    // offer: 作为发送方（拥有者）应答
+    if (data.type === 'offer') {
+      // 只有文件拥有者才应答
+      const meta = sharedFiles.get(fileId);
+      if (!meta || meta.ownerSocketId !== socket.id) {
+        console.warn(`[WebRTC] Received offer but not owner of ${fileId}`);
+        return;
+      }
+
+      console.log(`[WebRTC] Received offer for ${fileId} from ${from}`);
+      
+      const session = createPeerConnection(fileId, from, 'uploader');
+      const { pc } = session;
+      session.connectionStartTime = Date.now();
+
+      pc.ondatachannel = (ev) => {
+        console.log(`[WebRTC] Data channel received for ${fileId}`);
+        session.dc = ev.channel;
+        wireUploaderDataChannel(session);
+      };
+
+      await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+
+      console.log(`[WebRTC] Sending answer for ${fileId}`);
+      socket.emit('webrtc-signal', {
+        to: from,
+        fileId,
+        data: { type: 'answer', sdp: pc.localDescription }
+      });
+      return;
+    }
+
+    // answer: downloader 设置远端描述
+    if (data.type === 'answer') {
+      const session = rtcSessions.get(key);
+      if (!session) {
+        console.warn(`[WebRTC] Received answer but no session for ${fileId}`);
+        return;
+      }
+      console.log(`[WebRTC] Received answer for ${fileId}`);
+      await session.pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+      return;
+    }
+
+    // ICE
+    if (data.type === 'ice') {
+      const session = rtcSessions.get(key);
+      if (!session) {
+        console.warn(`[WebRTC] Received ICE candidate but no session for ${fileId}`);
+        return;
+      }
+      try {
+        await session.pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+        console.log(`[WebRTC] Added ICE candidate for ${fileId}:`, data.candidate.type);
+      } catch (e) {
+        console.error(`[WebRTC] Error adding ICE candidate:`, e);
+      }
+    }
+  } catch (error) {
+    console.error(`[WebRTC] Error handling signal for ${fileId}:`, error);
+    setFileStatus(fileId, '信令处理失败：' + error.message, null);
+  }
+});
+
+socket.on('sync', (data) => {
+  console.log('🔄 同步服务器内容');
+  setEditorContent(data.content);
+  state.lastContent = data.content;
+  updateUsersCount(data.usersCount);
+  updateLastSaved(data.updated_at);
+});
+
+socket.on('operation', (data) => {
+  console.log('📥 收到操作:', data);
+  applyOperation(data);
+});
+
+socket.on('operation-ack', (data) => {
+  updateLastSaved(data.timestamp);
+});
+
+socket.on('user-joined', (data) => {
+  console.log(`👥 用户加入: ${data.usersCount} 用户`);
+  updateUsersCount(data.usersCount);
+});
+
+socket.on('user-left', (data) => {
+  console.log(`👥 用户离开: ${data.usersCount} 用户`);
+  updateUsersCount(data.usersCount);
+});
+
+socket.on('password-required', (data) => {
+  console.log('🔒 需要密码');
+
+  // 显示密码输入框
+  document.getElementById('doc-id-display').textContent = `文档 ID: ${docId}`;
+  document.getElementById('password-modal').style.display = 'flex';
+  document.getElementById('password-overlay').style.display = 'flex';
+});
+
+socket.on('error', (data) => {
+  console.error('❌ 错误:', data.message);
+  if (data.message === '密码错误') {
+    document.getElementById('password-error').style.display = 'block';
+  } else if (data.message === '文档不存在') {
+    alert('文档不存在，将返回列表');
+    window.location.href = '/';
+  }
+});
+
+// 绑定编辑器事件
+bindEditorEvents();
+
+function bindEditorEvents() {
+  // 中文输入开始
+  editor.addEventListener('compositionstart', () => {
+    console.log('✍️ 开始输入中文');
+    state.isComposing = true;
+  });
+
+  // 中文输入结束
+  editor.addEventListener('compositionend', (e) => {
+    console.log('✍️ 输入完成');
+    state.isComposing = false;
+
+    const currentContent = editor.textContent;
+    submitContent(currentContent, true);
+  });
+
+  // 输入变化
+  editor.addEventListener('input', (e) => {
+    if (state.isComposing) return;
+
+    const currentContent = editor.textContent;
+
+    if (currentContent !== state.lastContent) {
+      throttleSubmit(currentContent);
+    }
+  });
+
+  // 粘贴事件
+  editor.addEventListener('paste', (e) => {
+    e.preventDefault();
+
+    const text = (e.clipboardData || window.clipboardData).getData('text/plain');
+    insertTextAtCursor(text);
+
+    const currentContent = editor.textContent;
+    submitContent(currentContent, true);
+  });
+
+  // 剪切事件
+  editor.addEventListener('cut', (e) => {
+    setTimeout(() => {
+      const currentContent = editor.textContent;
+      submitContent(currentContent, true);
+    }, 0);
+  });
+
+  // 离焦事件
+  editor.addEventListener('blur', () => {
+    console.log('👀 编辑器失去焦点');
+    if (state.throttleTimer) {
+      clearTimeout(state.throttleTimer);
+      state.throttleTimer = null;
+    }
+    const currentContent = editor.textContent;
+    submitContent(currentContent, true);
+  });
+
+  // 密码表单
+  document.getElementById('password-form').addEventListener('submit', (e) => {
+    e.preventDefault();
+
+    const password = document.getElementById('password-input').value;
+    if (!password) {
+      alert('请输入密码');
+      return;
+    }
+
+    state.password = password;
+    sessionStorage.setItem(`doc-password-${docId}`, password);
+
+    joinDocument(docId, password);
+  });
+}
+
+function throttleSubmit(content) {
+  if (state.throttleTimer) {
+    clearTimeout(state.throttleTimer);
+  }
+
+  state.throttleTimer = setTimeout(() => {
+    submitContent(content);
+    state.throttleTimer = null;
+  }, state.throttleDelay);
+}
+
+function submitContent(content, immediate = false) {
+  if (!socket || !socket.connected) {
+    console.log('⚠️ 未连接，暂不提交');
+    return;
+  }
+
+  let operation = null;
+  const oldContent = state.lastContent;
+
+  if (!oldContent || content === '') {
+    operation = {
+      type: 'set',
+      text: content,
+      position: 0,
+      timestamp: Date.now()
+    };
+  } else {
+    let pos = 0;
+    let i = 0;
+    while (i < oldContent.length && i < content.length && oldContent[i] === content[i]) {
+      i++;
+      pos++;
+    }
+
+    if (content.length > oldContent.length) {
+      const insertedText = content.slice(pos, pos + (content.length - oldContent.length));
+      operation = {
+        type: 'insert',
+        position: pos,
+        text: insertedText,
+        timestamp: Date.now()
+      };
+    } else if (content.length < oldContent.length) {
+      const deletedLength = oldContent.length - content.length;
+      operation = {
+        type: 'delete',
+        position: pos,
+        length: deletedLength,
+        text: '',
+        timestamp: Date.now()
+      };
+    } else {
+      operation = {
+        type: 'set',
+        text: content,
+        position: 0,
+        timestamp: Date.now()
+      };
+    }
+  }
+
+  console.log('📤 提交操作:', operation);
+  socket.emit('operation', operation);
+  state.lastContent = content;
+}
+
+function applyOperation(data) {
+  const currentContent = state.lastContent || editor.textContent;
+  let newContent = '';
+
+  if (data.type === 'set') {
+    newContent = data.text;
+  } else if (data.type === 'insert') {
+    const before = currentContent.slice(0, data.position);
+    const after = currentContent.slice(data.position);
+    newContent = before + data.text + after;
+  } else if (data.type === 'delete') {
+    const before = currentContent.slice(0, data.position);
+    const after = currentContent.slice(data.position + data.length);
+    newContent = before + after;
+  }
+
+  // 远端操作到达时，可能编辑器未聚焦/无选区，需做防御
+  const selection = window.getSelection();
+  let offset = 0;
+  if (selection && selection.rangeCount > 0) {
+    const range = selection.getRangeAt(0);
+    offset = getCaretCharacterOffsetWithin(range);
+  } else {
+    // 无选区时，尽量保持光标在末尾
+    offset = (currentContent || '').length;
+  }
+
+  setEditorContent(newContent, false);
+  state.lastContent = newContent;
+  updateLastSaved(data.updated_at);
+
+  setCaretPosition(Math.min(offset, newContent.length));
+}
+
+function getCaretCharacterOffsetWithin(range) {
+  const preCaretRange = range.cloneRange();
+  preCaretRange.selectNodeContents(editor);
+  preCaretRange.setEnd(range.endContainer, range.endOffset);
+  return preCaretRange.toString().length;
+}
+
+function setCaretPosition(offset) {
+  const range = document.createRange();
+  const selection = window.getSelection();
+
+  let charCount = 0;
+  let found = false;
+  const walker = document.createTreeWalker(
+    editor,
+    NodeFilter.SHOW_TEXT,
+    null,
+    false
+  );
+
+  while (walker.nextNode()) {
+    const node = walker.currentNode;
+    const nodeLength = node.length;
+
+    if (charCount + nodeLength >= offset) {
+      range.setStart(node, offset - charCount);
+      range.collapse(true);
+      found = true;
+      break;
+    }
+
+    charCount += nodeLength;
+  }
+
+  if (!found) {
+    const lastNode = editor.lastChild;
+    if (lastNode) {
+      range.setStartAfter(lastNode);
+      range.collapse(true);
+    } else {
+      range.setStart(editor, 0);
+      range.collapse(true);
+    }
+  }
+
+  selection.removeAllRanges();
+  selection.addRange(range);
+}
+
+function insertTextAtCursor(text) {
+  const selection = window.getSelection();
+  if (!selection || selection.rangeCount === 0) {
+    // 没有选区时，直接追加到末尾
+    editor.textContent = (editor.textContent || '') + text;
+    return;
+  }
+
+  const range = selection.getRangeAt(0);
+  range.deleteContents();
+  const textNode = document.createTextNode(text);
+  range.insertNode(textNode);
+
+  range.setStartAfter(textNode);
+  range.setEndAfter(textNode);
+  selection.removeAllRanges();
+  selection.addRange(range);
+}
+
+function setEditorContent(content, saveSelection = true) {
+  const oldContent = editor.textContent;
+
+  if (oldContent === content) return;
+
+  let offset = null;
+  if (saveSelection) {
+    const selection = window.getSelection();
+    if (selection.rangeCount > 0) {
+      const range = selection.getRangeAt(0);
+      offset = getCaretCharacterOffsetWithin(range);
+    }
+  }
+
+  editor.textContent = content;
+
+  if (saveSelection && offset !== null) {
+    setCaretPosition(Math.min(offset, content.length));
+  }
+}
+
+function updateConnectionStatus(connected) {
+  if (connected) {
+    connectionStatus.textContent = '在线';
+    connectionStatus.className = 'status online';
+  } else {
+    connectionStatus.textContent = '离线';
+    connectionStatus.className = 'status offline';
+  }
+}
+
+function updateUsersCount(count) {
+  usersCount.textContent = `👥 ${Math.max(0, count)} 用户`;
+}
+
+function updateLastSaved(timestamp) {
+  if (!timestamp) {
+    lastSaved.textContent = '未保存';
+    return;
+  }
+
+  const now = Date.now();
+  const diff = now - timestamp;
+
+  let text = '';
+  if (diff < 1000) {
+    text = '刚刚保存';
+  } else if (diff < 60000) {
+    text = `${Math.floor(diff / 1000)} 秒前保存`;
+  } else {
+    const date = new Date(timestamp);
+    const hours = date.getHours().toString().padStart(2, '0');
+    const minutes = date.getMinutes().toString().padStart(2, '0');
+    text = `${hours}:${minutes} 保存`;
+  }
+
+  lastSaved.textContent = text;
+}
+
+function showEditor() {
+  const overlay = document.getElementById('password-overlay');
+  const modal = document.getElementById('password-modal');
+  const container = document.getElementById('editor-container');
+
+  if (overlay) overlay.style.display = 'none';
+  if (modal) modal.style.display = 'none';
+  if (container) container.style.display = 'flex';  // 使用 flex 布局
+  if (editor) editor.classList.add('active');
+}
+
+console.log('🚀 Co-Editor 编辑器已启动 ');

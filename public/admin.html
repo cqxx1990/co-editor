@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Co-Editor - 管理后台</title>
+  <link rel="stylesheet" href="style.css">
+  <style>
+    .admin-table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 20px 0;
+    }
+
+    .admin-table th,
+    .admin-table td {
+      padding: 12px;
+      text-align: left;
+      border-bottom: 1px solid #e0e0e0;
+    }
+
+    .admin-table th {
+      background: #f5f5f5;
+      font-weight: 600;
+    }
+
+    .admin-table tr:hover {
+      background: #f9f9f9;
+    }
+
+    .admin-badge {
+      padding: 4px 8px;
+      border-radius: 4px;
+      font-size: 12px;
+      font-weight: 500;
+    }
+
+    .badge-public {
+      background: #e8f5e9;
+      color: #2e7d32;
+    }
+
+    .badge-private {
+      background: #ffebee;
+      color: #c62828;
+    }
+
+    .btn-sm {
+      padding: 4px 12px;
+      font-size: 12px;
+    }
+
+    #login-form {
+      max-width: 400px;
+      margin: 100px auto;
+      padding: 30px;
+      background: #fff;
+      border-radius: 8px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+    }
+
+    #admin-panel {
+      display: none;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <!-- 登录表单 -->
+    <div id="login-form">
+      <h2>🔐 管理后台登录</h2>
+      <form id="login">
+        <div class="form-group">
+          <label>管理员密码</label>
+          <input type="password" id="admin-password" placeholder="输入管理员密码" required>
+          <p class="error" id="login-error" style="display: none;">密码错误</p>
+        </div>
+        <div class="form-actions">
+          <a href="/" class="btn btn-secondary">返回</a>
+          <button type="submit" class="btn btn-primary">登录</button>
+        </div>
+      </form>
+    </div>
+
+    <!-- 管理面板 -->
+    <div id="admin-panel">
+      <header class="header">
+        <h1>🔧 管理后台</h1>
+        <div class="status-bar">
+          <a href="/" class="btn btn-secondary">返回首页</a>
+        </div>
+      </header>
+
+      <main class="main">
+        <div class="section-header">
+          <h2>文档列表</h2>
+          <button class="btn btn-primary" onclick="loadDocuments()">刷新</button>
+        </div>
+
+        <table class="admin-table">
+          <thead>
+            <tr>
+              <th>文档 ID</th>
+              <th>创建人</th>
+              <th>权限</th>
+              <th>创建时间</th>
+              <th>更新时间</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="documents-table-body">
+            <tr>
+              <td colspan="6" class="loading">加载中...</td>
+            </tr>
+          </tbody>
+        </table>
+      </main>
+
+      <footer class="footer">
+        <a href="mailto:624167284@qq.com">624167284@qq.com</a>
+      </footer>
+    </div>
+  </div>
+
+  <script src="admin.js"></script>
+</body>
+</html>

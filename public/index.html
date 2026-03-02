@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Co-Editor - 协同编辑+文件共享</title>
+  <meta name="description" content="Co-Editor 是一个基于 Node.js 和 Socket.IO 的协同编辑平台，支持多人实时编辑文档和文件共享。">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="container">
+    <header class="header">
+      <h1>📝 Co-Editor</h1>
+      <div class="status-bar">
+        <a href="#create-modal" class="btn btn-primary" onclick="openCreateModal()">+ 新建文档</a>
+      </div>
+    </header>
+
+    <main class="main">
+      <div class="documents-list" id="documents-list">
+        <div class="loading">加载中...</div>
+      </div>
+    </main>
+
+    <footer class="footer">
+      <div class="contact">联系方式：624167284@qq.com</div>
+    </footer>
+  </div>
+
+  <!-- 创建文档模态框 -->
+  <div id="create-modal" class="modal" style="display: none;">
+    <div class="modal-content">
+      <h2>创建新文档</h2>
+      <form id="create-form">
+        <div class="form-group">
+          <label>文档 ID</label>
+          <input type="text" id="doc-id" placeholder="输入文档 ID（如：mydoc）" required pattern="[a-zA-Z0-9_-]+" title="只能包含字母、数字、下划线和横线">
+          <small>用于访问文档的 URL 路径</small>
+        </div>
+        <div class="form-group">
+          <label class="checkbox-label">
+            <input type="checkbox" id="has-password">
+            <span>设置密码保护</span>
+          </label>
+        </div>
+        <div class="form-group" id="password-group" style="display: none;">
+          <label>密码</label>
+          <input type="password" id="doc-password" placeholder="设置访问密码（可选）">
+        </div>
+        <div class="form-actions">
+          <button type="button" class="btn btn-secondary" onclick="closeCreateModal()">取消</button>
+          <button type="submit" class="btn btn-primary">创建</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="main.js"></script>
+</body>
+</html>

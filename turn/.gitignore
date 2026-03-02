@@ -1,0 +1,17 @@
+# Docker 相关文件
+.env
+turnserver.conf
+logs/
+turnserver.pid
+
+# 数据库
+*.db
+*.db-journal
+
+# 备份文件
+*.backup
+*.bak
+
+# 临时文件
+*.tmp
+*.log
