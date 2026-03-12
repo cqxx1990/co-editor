@@ -1,13 +1,47 @@
 // server.js - Co-Editor 服务器 (v2)
 const express = require('express');
 const http = require('http');
+const https = require('https');
+const fs = require('fs');
 const { Server } = require('socket.io');
 const crypto = require('crypto');
 const path = require('path');
 const CoEditorDB = require('./database');
 
 const app = express();
-const server = http.createServer(app);
+
+// 从环境变量读取消 HTTPS 配置
+let server;
+let protocol = 'http';
+const httpsEnabled = process.env.HTTPS_ENABLED === 'true';
+
+if (httpsEnabled) {
+  try {
+    const keyPath = path.resolve(process.env.HTTPS_KEY_PATH || './certs/privkey.pem');
+    const certPath = path.resolve(process.env.HTTPS_CERT_PATH || './certs/cert.pem');
+
+    if (!fs.existsSync(keyPath) || !fs.existsSync(certPath)) {
+      throw new Error(`证书文件不存在: ${keyPath} 或 ${certPath}`);
+    }
+
+    const options = {
+      key: fs.readFileSync(keyPath),
+      cert: fs.readFileSync(certPath)
+    };
+
+    server = https.createServer(options, app);
+    protocol = 'https';
+    console.log(`✅ HTTPS 已启用，证书: ${keyPath}`);
+  } catch (err) {
+    console.error(`❌ HTTPS 启动失败，回退到 HTTP: ${err.message}`);
+    server = http.createServer(app);
+    protocol = 'http';
+  }
+} else {
+  server = http.createServer(app);
+  protocol = 'http';
+}
+
 const io = new Server(server, {
   cors: {
     origin: "*",
@@ -356,9 +390,9 @@ app.get('/health', (req, res) => {
 // 启动服务器
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`🚀 Co-Editor v2 服务运行在 http://localhost:${PORT}`);
+  console.log(`🚀 Co-Editor v2 服务运行在 ${protocol}://localhost:${PORT}`);
   console.log(`💾 数据库: co-editor.db`);
-  console.log(`🔐 管理后台: http://localhost:${PORT}/admin.html (密码: ${ADMIN_PASSWORD})`);
+  console.log(`🔐 管理后台: ${protocol}://localhost:${PORT}/admin.html (密码: ${ADMIN_PASSWORD})`);
 });
 
 // 优雅关闭
