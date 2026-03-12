@@ -629,3 +629,73 @@ body {
     text-align: center;
   }
 }
+
+/* File Tree Styles */
+.file-tree-folder {
+  border-radius: 6px;
+  margin-bottom: 4px;
+}
+
+.file-tree-folder-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  cursor: pointer;
+  border-radius: 6px;
+  transition: all 0.2s ease;
+  user-select: none;
+}
+
+.file-tree-folder-header:hover {
+  background: #f5f5f5;
+}
+
+.file-tree-folder-header:active {
+  background: #e8f5e9;
+}
+
+.folder-icon {
+  font-size: 18px;
+  flex-shrink: 0;
+}
+
+.folder-name {
+  flex: 1;
+  font-weight: 500;
+  color: #495057;
+  font-size: 14px;
+}
+
+.folder-arrow {
+  font-size: 10px;
+  color: #999;
+  transition: transform 0.2s ease;
+  flex-shrink: 0;
+}
+
+.file-tree-folder-header:hover .folder-arrow {
+  color: #666;
+}
+
+.file-tree-children {
+  animation: fadeIn 0.2s ease;
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(-5px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* 嵌套的文件需要调整间距 */
+.file-tree-children .file-item {
+  border-left: 1px solid #e0e0e0;
+  margin-left: 8px;
+  padding-left: 8px;
+}

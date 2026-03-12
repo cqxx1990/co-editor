@@ -83,7 +83,8 @@ function getFileShareMap(docId) {
 
 // HTTP API - 文档列表
 app.get('/api/documents', (req, res) => {
-  const docs = db.listDocuments();
+  const userId = req.query.user_id || req.headers['x-user-id'];
+  const docs = db.listDocuments(userId);
   res.json({ success: true, documents: docs });
 });
 
@@ -163,7 +164,7 @@ io.on('connection', (socket) => {
 
   // 加入文档房间
   socket.on('join-document', (data) => {
-    const { docId, password } = data;
+    const { docId, password, user_id } = data;
 
     if (!docId) {
       socket.emit('error', { message: '缺少文档 ID' });
@@ -178,19 +179,41 @@ io.on('connection', (socket) => {
     }
 
     // 如果有密码保护，需要验证
-    if (!docMeta.is_public) {
-      // 检查 sessionStorage 中的密码（从客户端传来）
+    const needsPassword = docMeta.password_hash && docMeta.password_hash.length > 0;
+
+    console.log(`🔐 文档 ${docId} 密码验证:`);
+    console.log(`   - password_hash 存在: ${!!docMeta.password_hash}`);
+    console.log(`   - password_hash 长度: ${docMeta.password_hash?.length || 0}`);
+    console.log(`   - 提供的密码: ${password ? '是 (' + password.length + ' 字符)' : '否'}`);
+    console.log(`   - is_public: ${docMeta.is_public}`);
+    console.log(`   - needsPassword: ${needsPassword}`);
+
+    if (needsPassword) {
+      // 检查密码
       if (!password) {
+        console.log(`❌ 需要密码但未提供，发送 password-required`);
         socket.emit('password-required', { docId });
         return;
       }
 
       const passwordHash = simpleHash(password);
+      console.log(`   - 计算的密码哈希: ${passwordHash.substring(0, 10)}...`);
+      console.log(`   - 存储的密码哈希: ${docMeta.password_hash.substring(0, 10)}...`);
+
       if (!db.verifyPassword(docId, passwordHash)) {
+        console.log(`❌ 密码验证失败`);
         socket.emit('error', { message: '密码错误' });
         return;
       }
+
+      console.log(`✅ 密码验证成功`);
+    } else {
+      console.log(`✅ 文档 ${docId} 是公开的，无需密码`);
     }
+
+    // 记录文档访问
+    const userId = user_id || socket.id;
+    db.recordAccess(docId, userId);
 
     // 获取文档内容
     const doc = db.getDocument(docId);
@@ -300,18 +323,21 @@ io.on('connection', (socket) => {
   // WebRTC 文件分享：新增共享文件（只存元数据）
   socket.on('file-share-add', (payload) => {
     if (!currentDocId || !currentRoom) return;
-    const { name, size, mime, ownerUserLabel, clientTempId } = payload || {};
+    const { name, path, displayName, size, mime, ownerUserLabel, clientTempId, isFolder } = payload || {};
     if (!name || typeof size !== 'number') return;
 
     const fileId = crypto.randomBytes(12).toString('hex');
     const meta = {
       fileId,
       name,
+      path: path || name,  // 完整路路径
+      displayName: displayName || name,
       size,
       mime: mime || 'application/octet-stream',
       ownerSocketId: socket.id,
       ownerUserLabel: ownerUserLabel || '',
       clientTempId: clientTempId || null,
+      isFolder: isFolder || false,  // 是否包含文件夹结构
       createdAt: Date.now(),
       docId: currentDocId
     };

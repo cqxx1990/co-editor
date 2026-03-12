@@ -1,11 +1,67 @@
 // editor.js - 编辑器逻辑
 
 // =============================
-// TURN 服务器配置（部署时修改此处）
+// 用户标识
 // =============================
-const TURN_SERVER = 'your-server.com'; // 修改为你的服务器域名或 IP
-const TURN_USER = 'coeditor';
-const TURN_PASSWORD = 'turn2024pass';
+
+// 生成设备 ID
+const deviceId = localStorage.getItem('co-editor-device-id') || generateDeviceId();
+
+function generateDeviceId() {
+  const id = 'dev_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+  localStorage.setItem('co-editor-device-id', id);
+  return id;
+}
+
+// =============================
+// WebRTC 配置
+// =============================
+
+// TURN 服务器配置（部署时修改此处）
+const TURN_SERVER = 'share.wuyuan.tech'; // 修改为你的服务器域名或 IP
+const TURN_USER = 'co-editor-user';
+const TURN_PASSWORD = 'oa90GJlg3lad.g3l;';
+
+console.log('[WebRTC] 🚀 生产模式：使用 STUN + TURN 服务器');
+console.log(`[WebRTC] TURN 服务器: ${TURN_SERVER}`);
+
+const RTC_CONFIG = {
+  iceServers: [
+    // STUN 服务器（用于 NAT 穿透）
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'stun:stun2.l.google.com:19302' },
+    // 自建 TURN 服务器（优先级最高）
+    {
+      urls: `turn:${TURN_SERVER}:3478`,
+      username: TURN_USER,
+      credential: TURN_PASSWORD
+    },
+    {
+      urls: `turn:${TURN_SERVER}:3478?transport=tcp`,
+      username: TURN_USER,
+      credential: TURN_PASSWORD
+    },
+    // 免费备用 TURN 服务器（当自建服务器不可用时）
+    {
+      urls: 'turn:openrelay.metered.ca:80',
+      username: 'openrelayproject',
+      credential: 'openrelayproject'
+    },
+    {
+      urls: 'turn:openrelay.metered.ca:443',
+      username: 'openrelayproject',
+      credential: 'openrelayproject'
+    },
+    {
+      urls: 'turn:openrelay.metered.ca:443?transport=tcp',
+      username: 'openrelayproject',
+      credential: 'openrelayproject'
+    }
+  ],
+  iceTransportPolicy: 'all', // 尝试所有可用的连接方式
+  iceCandidatePoolSize: 10 // 预先收集候选
+};
 
 const socket = io();
 const editor = document.getElementById('editor');
@@ -51,44 +107,6 @@ const pendingLocalAdds = new Map(); // clientTempId -> File
 // WebRTC 会话：key = `${fileId}:${peerSocketId}`
 const rtcSessions = new Map();
 
-const RTC_CONFIG = {
-  iceServers: [
-    // STUN 服务器（用于 NAT 穿透）
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' },
-    { urls: 'stun:stun2.l.google.com:19302' },
-    // 自建 TURN 服务器（优先级最高）
-    {
-      urls: `turn:${TURN_SERVER}:3478`,
-      username: TURN_USER,
-      credential: TURN_PASSWORD
-    },
-    {
-      urls: `turn:${TURN_SERVER}:3478?transport=tcp`,
-      username: TURN_USER,
-      credential: TURN_PASSWORD
-    },
-    // 免费备用 TURN 服务器（当自建服务器不可用时）
-    {
-      urls: 'turn:openrelay.metered.ca:80',
-      username: 'openrelayproject',
-      credential: 'openrelayproject'
-    },
-    {
-      urls: 'turn:openrelay.metered.ca:443',
-      username: 'openrelayproject',
-      credential: 'openrelayproject'
-    },
-    {
-      urls: 'turn:openrelay.metered.ca:443?transport=tcp',
-      username: 'openrelayproject',
-      credential: 'openrelayproject'
-    }
-  ],
-  iceTransportPolicy: 'all', // 尝试所有可用的连接方式
-  iceCandidatePoolSize: 10 // 预先收集候选
-};
-
 function formatBytes(bytes) {
   if (typeof bytes !== 'number' || Number.isNaN(bytes)) return '';
   const units = ['B', 'KB', 'MB', 'GB'];
@@ -132,6 +150,25 @@ function ensureFileShareUI() {
     const files = await extractFilesFromDataTransfer(e.dataTransfer);
     if (files.length) await shareFiles(files);
   });
+
+  // 使用事件委托处理文件列表点击（避免重复绑定）
+  fileListEl.addEventListener('click', async (e) => {
+    const btn = e.target.closest('button');
+    if (!btn) return;
+
+    const action = btn.dataset.action;
+    const fileItem = btn.closest('.file-item');
+    const fileId = fileItem?.dataset?.fileId;
+
+    if (action === 'remove' && fileId) {
+      socket.emit('file-share-remove', { fileId });
+    } else if (action === 'download' && fileId) {
+      const meta = sharedFiles.get(fileId);
+      if (meta) {
+        await startDownload(meta);
+      }
+    }
+  });
 }
 
 async function extractFilesFromDataTransfer(dt) {
@@ -145,16 +182,17 @@ async function extractFilesFromDataTransfer(dt) {
     return Array.from(dt.files || []);
   }
 
-  const out = [];
+  const outFiles = [];
 
-  const walkEntry = async (entry, prefix = '') => {
+  const walkEntry = async (entry, path = '') => {
     if (!entry) return;
 
     if (entry.isFile) {
       await new Promise((resolve) => {
         entry.file((file) => {
-          const wrapped = new File([file], `${prefix}${file.name}`, { type: file.type });
-          out.push(wrapped);
+          // 保存完整路径
+          file.fullPath = path + file.name;
+          outFiles.push(file);
           resolve();
         }, resolve);
       });
@@ -163,11 +201,13 @@ async function extractFilesFromDataTransfer(dt) {
 
     if (entry.isDirectory) {
       const reader = entry.createReader();
+      const dirPath = path + entry.name + '/';
+
       const readBatch = async () => {
         const entries = await new Promise((resolve) => reader.readEntries(resolve));
         if (!entries || !entries.length) return;
         for (const child of entries) {
-          await walkEntry(child, `${prefix}${entry.name}/`);
+          await walkEntry(child, dirPath);
         }
         await readBatch();
       };
@@ -182,10 +222,13 @@ async function extractFilesFromDataTransfer(dt) {
 
   // fallback: 兜底补充 dt.files
   for (const f of Array.from(dt.files || [])) {
-    if (!out.some((x) => x.name === f.name && x.size === f.size)) out.push(f);
+    if (!f.fullPath) f.fullPath = f.name;
+    if (!outFiles.some((x) => x.name === f.name && x.size === f.size)) {
+      outFiles.push(f);
+    }
   }
 
-  return out;
+  return outFiles;
 }
 
 async function shareFiles(files) {
@@ -199,14 +242,145 @@ async function shareFiles(files) {
     const clientTempId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
     pendingLocalAdds.set(clientTempId, file);
 
+    // 获取文件显示名称（去掉路径）
+    const displayName = file.fullPath ? file.fullPath : file.name;
+    const isFolder = displayName.includes('/');
+
     socket.emit('file-share-add', {
-      name: file.name,
+      name: file.name,  // 文件名
+      path: file.fullPath || file.name,  // 完整路径（如果有）
+      displayName: displayName,  // 显示名称
       size: file.size,
       mime: file.type || 'application/octet-stream',
       ownerUserLabel: '我',
-      clientTempId
+      clientTempId,
+      isFolder: isFolder
     });
   }
+}
+
+/**
+ * 构建文件树结构
+ */
+function buildFileTree(files) {
+  const tree = {};
+
+  for (const file of files) {
+    const path = file.path || file.name;
+    const parts = path.split('/').filter(p => p);  // 过滤空字符串
+
+    let current = tree;
+    for (let i = 0; i < parts.length; i++) {
+      const part = parts[i];
+      const isFile = i === parts.length - 1;
+
+      if (!current[part]) {
+        current[part] = {
+          name: part,
+          isFolder: !isFile,
+          file: isFile ? file : null,
+          children: {}
+        };
+      }
+
+      if (isFile) {
+        current[part].file = file;
+      } else {
+        current = current[part].children;
+      }
+    }
+  }
+
+  return tree;
+}
+
+/**
+ * 渲染文件树
+ */
+function renderFileTree(tree, level = 0) {
+  let html = '';
+
+  for (const [name, node] of Object.entries(tree)) {
+    const indent = level * 16;
+    const icon = node.isFolder ? '📁' : getFileIcon(node.file?.mime || '');
+    const fileId = node.file?.fileId || null;
+
+    if (node.isFolder) {
+      // 文件夹
+      const folderId = `folder-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      html += `
+        <div class="file-tree-folder" data-folder-id="${folderId}" style="padding-left: ${indent}px">
+          <div class="file-tree-folder-header" onclick="toggleFolder('${folderId}')">
+            <span class="folder-icon">📁</span>
+            <span class="folder-name">${escapeHtml(name)}</span>
+            <span class="folder-arrow">▶</span>
+          </div>
+          <div class="file-tree-children" id="${folderId}-children" style="display: none;">
+            ${renderFileTree(node.children, level + 1)}
+          </div>
+        </div>
+      `;
+    } else if (fileId) {
+      // 文件
+      const isOwner = node.file.ownerSocketId === socket.id;
+      const ownerLabel = isOwner ? '我' : (node.file.ownerUserLabel || node.file.ownerSocketId.slice(0, 6));
+
+      html += `
+        <div class="file-item" data-file-id="${fileId}" style="padding-left: ${indent}px">
+          <div class="file-item__meta">
+            <div class="file-item__name" title="${escapeHtml(node.file.displayName || node.file.name)}">${escapeHtml(node.file.displayName || node.file.name)}</div>
+            <div class="file-item__sub">
+              <span>${icon} ${formatBytes(node.file.size)}</span>
+              <span>来源: ${escapeHtml(ownerLabel)}</span>
+            </div>
+            <div class="progress" style="display:none"><div></div></div>
+            <div class="file-item__sub file-item__status" style="display:none"></div>
+          </div>
+          <div class="file-item__actions">
+            ${isOwner ? `<button class="btn btn-danger" data-action="remove">移除</button>` : `<button class="btn btn-primary" data-action="download">下载</button>`}
+          </div>
+        </div>
+      `;
+    }
+  }
+
+  return html;
+}
+
+/**
+ * 切换文件夹展开/折叠
+ */
+function toggleFolder(folderId) {
+  const childrenContainer = document.getElementById(`${folderId}-children`);
+  const header = document.querySelector(`[data-folder-id="${folderId}"] .file-tree-folder-header`);
+  const arrow = header.querySelector('.folder-arrow');
+  const icon = header.querySelector('.folder-icon');
+
+  if (childrenContainer) {
+    const isExpanded = childrenContainer.style.display !== 'none';
+    childrenContainer.style.display = isExpanded ? 'none' : 'block';
+    arrow.textContent = isExpanded ? '▶' : '▼';
+    icon.textContent = isExpanded ? '📁' : '📂';
+  }
+}
+
+/**
+ * 根据文件类型获取图标
+ */
+function getFileIcon(mimeType) {
+  if (!mimeType) return '📄';
+
+  if (mimeType.startsWith('image/')) return '🖼️';
+  if (mimeType.startsWith('video/')) return '🎬';
+  if (mimeType.startsWith('audio/')) return '🎵';
+  if (mimeType.includes('pdf')) return '📕';
+  if (mimeType.includes('zip') || mimeType.includes('rar') || mimeType.includes('tar') || mimeType.includes('7z')) return '📦';
+  if (mimeType.includes('text/') || mimeType.includes('json') || mimeType.includes('xml') || mimeType.includes('javascript')) return '📝';
+  if (mimeType.includes('word') || mimeType.includes('document')) return '📑';
+  if (mimeType.includes('excel') || mimeType.includes('spreadsheet')) return '📊';
+  if (mimeType.includes('powerpoint') || mimeType.includes('presentation')) return '📽️';
+
+  return '📄';
 }
 
 function renderSharedFiles() {
@@ -218,45 +392,13 @@ function renderSharedFiles() {
     return;
   }
 
-  fileListEl.innerHTML = files.map((f) => {
-    const isOwner = f.ownerSocketId === socket.id;
-    const ownerLabel = isOwner ? '我' : (f.ownerUserLabel || f.ownerSocketId.slice(0, 6));
-    return `
-      <div class="file-item" data-file-id="${f.fileId}">
-        <div class="file-item__meta">
-          <div class="file-item__name" title="${escapeHtml(f.name)}">${escapeHtml(f.name)}</div>
-          <div class="file-item__sub">
-            <span>大小: ${formatBytes(f.size)}</span>
-            <span>来源: ${escapeHtml(ownerLabel)}</span>
-          </div>
-          <div class="progress" style="display:none"><div></div></div>
-          <div class="file-item__sub file-item__status" style="display:none"></div>
-        </div>
-        <div class="file-item__actions">
-          ${isOwner ? `<button class="btn btn-danger" data-action="remove">移除</button>` : `<button class="btn btn-primary" data-action="download">下载</button>`}
-        </div>
-      </div>
-    `;
-  }).join('');
+  // 构建文件树并渲染
+  const tree = buildFileTree(files);
+  const treeHtml = renderFileTree(tree);
 
-  // bind actions
-  fileListEl.querySelectorAll('[data-action="remove"]').forEach((btn) => {
-    btn.addEventListener('click', () => {
-      const fileId = btn.closest('.file-item')?.dataset?.fileId;
-      if (!fileId) return;
-      socket.emit('file-share-remove', { fileId });
-    });
-  });
+  fileListEl.innerHTML = treeHtml;
 
-  fileListEl.querySelectorAll('[data-action="download"]').forEach((btn) => {
-    btn.addEventListener('click', async () => {
-      const fileId = btn.closest('.file-item')?.dataset?.fileId;
-      if (!fileId) return;
-      const meta = sharedFiles.get(fileId);
-      if (!meta) return;
-      await startDownload(meta);
-    });
-  });
+  // 注意：移除了事件监听器的直接绑定，改为在页面初始化时使用事件委托
 }
 
 function escapeHtml(s) {
@@ -266,6 +408,37 @@ function escapeHtml(s) {
     .replaceAll('>', '&gt;')
     .replaceAll('"', '&quot;')
     .replaceAll("'", '&#39;');
+}
+
+/**
+ * 将文本中的换行符转换为 HTML <br> 标签
+ */
+function textToHtml(text) {
+  return escapeHtml(text).replace(/\n/g, '<br>') || '<br>';
+}
+
+/**
+ * 将 HTML 内容转换为纯文本，<br> 转换为换行符
+ */
+function htmlToText(html) {
+  // 创建临时 div 来转换
+  const div = document.createElement('div');
+  div.innerHTML = html || '';
+  return div.textContent || div.innerText || '';
+}
+
+/**
+ * 获取编辑器内容作为纯文本（使用 <br> 作为换行）
+ */
+function getEditorTextContent() {
+  return htmlToText(editor.innerHTML);
+}
+
+/**
+ * 设置编辑器内容（将换行符转换为 <br>）
+ */
+function setEditorTextContent(text) {
+  editor.innerHTML = textToHtml(text);
 }
 
 function getFileItemEls(fileId) {
@@ -518,7 +691,11 @@ function wireDownloaderDataChannel(session) {
           session.recv.name = msg.name || 'download';
           setFileStatus(fileId, `开始接收：0 / ${formatBytes(msg.size)}`, 0);
         } else if (msg.type === 'done') {
-          finalizeDownload(session);
+          // 防止重复下载：检查是否已经完成
+          if (!session.recv.finalized) {
+            session.recv.finalized = true;
+            finalizeDownload(session);
+          }
         }
       } catch {
         // ignore
@@ -536,7 +713,9 @@ function wireDownloaderDataChannel(session) {
       const p = total ? (session.recv.received / total) : null;
       setFileStatus(fileId, `接收中：${formatBytes(session.recv.received)} / ${formatBytes(total)}`, p);
 
-      if (total && session.recv.received >= total) {
+      // 防止重复下载：检查是否已经完成
+      if (total && session.recv.received >= total && !session.recv.finalized) {
+        session.recv.finalized = true;
         finalizeDownload(session);
       }
     }
@@ -660,8 +839,9 @@ if (savedPassword) {
 
 // 加入文档函数
 function joinDocument(docId, password) {
-  console.log('📄 加入文档:', docId, password ? '(有密码)' : '(无密码)');
-  socket.emit('join-document', { docId, password });
+  console.log('📄 加入文档:', docId, password ? '(有密码: ' + password.length + ' 字符)' : '(无密码)');
+  console.log('📄 使用 user_id:', deviceId);
+  socket.emit('join-document', { docId, password, user_id: deviceId });
 }
 
 // Socket.io 事件处理
@@ -670,9 +850,12 @@ socket.on('connect', () => {
   updateConnectionStatus(true);
 
   // 连接成功后加入文档
-  if (state.password) {
-    joinDocument(docId, state.password);
+  const savedPassword = state.password || sessionStorage.getItem(`doc-password-${docId}`);
+  if (savedPassword) {
+    console.log('🔑 使用保存的密码加入文档');
+    joinDocument(docId, savedPassword);
   } else {
+    console.log('📄 直接加入文档（无密码）');
     joinDocument(docId, '');
   }
 });
@@ -714,6 +897,9 @@ socket.on('io-reconnect', () => {
 
 socket.on('init', (data) => {
   console.log('📥 收到初始内容');
+  console.log('📄 内容长度:', data.content?.length || 0);
+  console.log('👥 用户数:', data.usersCount);
+
   showEditor();
   setEditorContent(data.content);
   state.lastContent = data.content;
@@ -862,15 +1048,36 @@ socket.on('password-required', (data) => {
   document.getElementById('doc-id-display').textContent = `文档 ID: ${docId}`;
   document.getElementById('password-modal').style.display = 'flex';
   document.getElementById('password-overlay').style.display = 'flex';
+
+  // 清空之前的错误信息
+  document.getElementById('password-error').style.display = 'none';
+  document.getElementById('password-input').value = '';
+
+  // 自动聚焦密码输入框
+  setTimeout(() => {
+    document.getElementById('password-input').focus();
+  }, 100);
+
+  console.log('✅ 密码输入框已显示');
 });
 
 socket.on('error', (data) => {
   console.error('❌ 错误:', data.message);
   if (data.message === '密码错误') {
     document.getElementById('password-error').style.display = 'block';
-  } else if (data.message === '文档不存在') {
+    document.getElementById('password-input').value = '';
+    document.getElementById('password-input').focus();
+
+    // 清除保存的错误密码
+    sessionStorage.removeItem(`doc-password-${docId}`);
+    state.password = null;
+
+    console.log('🗑️  已清除保存的密码');
+  } else if (data.message.includes('文档不存在')) {
     alert('文档不存在，将返回列表');
     window.location.href = '/';
+  } else {
+    alert('错误: ' + data.message);
   }
 });
 
@@ -897,7 +1104,7 @@ function bindEditorEvents() {
   editor.addEventListener('input', (e) => {
     if (state.isComposing) return;
 
-    const currentContent = editor.textContent;
+    const currentContent = getEditorTextContent();
 
     if (currentContent !== state.lastContent) {
       throttleSubmit(currentContent);
@@ -911,14 +1118,14 @@ function bindEditorEvents() {
     const text = (e.clipboardData || window.clipboardData).getData('text/plain');
     insertTextAtCursor(text);
 
-    const currentContent = editor.textContent;
+    const currentContent = getEditorTextContent();
     submitContent(currentContent, true);
   });
 
   // 剪切事件
   editor.addEventListener('cut', (e) => {
     setTimeout(() => {
-      const currentContent = editor.textContent;
+      const currentContent = getEditorTextContent();
       submitContent(currentContent, true);
     }, 0);
   });
@@ -930,7 +1137,7 @@ function bindEditorEvents() {
       clearTimeout(state.throttleTimer);
       state.throttleTimer = null;
     }
-    const currentContent = editor.textContent;
+    const currentContent = getEditorTextContent();
     submitContent(currentContent, true);
   });
 
@@ -949,6 +1156,16 @@ function bindEditorEvents() {
 
     joinDocument(docId, password);
   });
+
+  // 分享模态框 - 点击外部关闭
+  const shareModal = document.getElementById('share-modal');
+  if (shareModal) {
+    shareModal.addEventListener('click', (e) => {
+      if (e.target.id === 'share-modal') {
+        closeShareModal();
+      }
+    });
+  }
 }
 
 function throttleSubmit(content) {
@@ -1019,7 +1236,7 @@ function submitContent(content, immediate = false) {
 }
 
 function applyOperation(data) {
-  const currentContent = state.lastContent || editor.textContent;
+  const currentContent = state.lastContent || getEditorTextContent();
   let newContent = '';
 
   if (data.type === 'set') {
@@ -1105,7 +1322,7 @@ function insertTextAtCursor(text) {
   const selection = window.getSelection();
   if (!selection || selection.rangeCount === 0) {
     // 没有选区时，直接追加到末尾
-    editor.textContent = (editor.textContent || '') + text;
+    editor.innerHTML = (editor.innerHTML || '<br>') + text;
     return;
   }
 
@@ -1121,7 +1338,7 @@ function insertTextAtCursor(text) {
 }
 
 function setEditorContent(content, saveSelection = true) {
-  const oldContent = editor.textContent;
+  const oldContent = getEditorTextContent();
 
   if (oldContent === content) return;
 
@@ -1134,7 +1351,8 @@ function setEditorContent(content, saveSelection = true) {
     }
   }
 
-  editor.textContent = content;
+  // 使用新的方法设置内容（支持换行）
+  setEditorTextContent(content);
 
   if (saveSelection && offset !== null) {
     setCaretPosition(Math.min(offset, content.length));
@@ -1180,14 +1398,119 @@ function updateLastSaved(timestamp) {
 }
 
 function showEditor() {
+  console.log('🎬 显示编辑器');
   const overlay = document.getElementById('password-overlay');
   const modal = document.getElementById('password-modal');
   const container = document.getElementById('editor-container');
+  const shareBtn = document.getElementById('share-btn');
 
-  if (overlay) overlay.style.display = 'none';
-  if (modal) modal.style.display = 'none';
-  if (container) container.style.display = 'flex';  // 使用 flex 布局
-  if (editor) editor.classList.add('active');
+  if (overlay) {
+    overlay.style.display = 'none';
+    console.log('✅ 隐藏密码覆盖层');
+  }
+  if (modal) {
+    modal.style.display = 'none';
+    console.log('✅ 隐藏密码模态框');
+  }
+  if (container) {
+    container.style.display = 'flex';
+    console.log('✅ 显示编辑器容器');
+  }
+  if (editor) {
+    editor.classList.add('active');
+    // 聚焦编辑器
+    editor.focus();
+  }
+  if (shareBtn) {
+    shareBtn.style.display = 'inline-block';
+    console.log('✅ 显示分享按钮');
+  }
+}
+
+// =============================
+// 分享功能
+// =============================
+
+/**
+ * 显示分享模态框
+ */
+function showShareModal() {
+  const shareUrl = window.location.href;
+  const shareUrlInput = document.getElementById('share-url');
+  const shareModal = document.getElementById('share-modal');
+  const copyStatus = document.getElementById('copy-status');
+
+  shareUrlInput.value = shareUrl;
+  copyStatus.style.display = 'none';
+  shareModal.style.display = 'flex';
+
+  // 生成二维码
+  generateQRCode(shareUrl);
+}
+
+/**
+ * 关闭分享模态框
+ */
+function closeShareModal() {
+  const shareModal = document.getElementById('share-modal');
+  shareModal.style.display = 'none';
+}
+
+/**
+ * 复制分享链接
+ */
+function copyShareUrl() {
+  const shareUrlInput = document.getElementById('share-url');
+  const copyStatus = document.getElementById('copy-status');
+
+  shareUrlInput.select();
+  shareUrlInput.setSelectionRange(0, 99999); // 移动设备兼容
+
+  try {
+    navigator.clipboard.writeText(shareUrlInput.value).then(() => {
+      copyStatus.style.display = 'block';
+      setTimeout(() => {
+        copyStatus.style.display = 'none';
+      }, 2000);
+    });
+  } catch (err) {
+    // 降级方案
+    document.execCommand('copy');
+    copyStatus.style.display = 'block';
+    setTimeout(() => {
+      copyStatus.style.display = 'none';
+    }, 2000);
+  }
+}
+
+/**
+ * 生成二维码
+ */
+async function generateQRCode(url) {
+  const qrCodeContainer = document.getElementById('qr-code');
+  qrCodeContainer.innerHTML = '二维码生成中...';
+
+  try {
+    // 使用免费的 QRCode API
+    const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(url)}`;
+    const img = new Image();
+    img.alt = '文档二维码';
+    img.style.maxWidth = '100%';
+
+    img.onload = () => {
+      qrCodeContainer.innerHTML = '';
+      qrCodeContainer.appendChild(img);
+    };
+
+    img.onerror = () => {
+      qrCodeContainer.innerHTML = '二维码生成失败';
+    };
+
+    img.src = qrUrl;
+  } catch (error) {
+    console.error('生成二维码失败:', error);
+    qrCodeContainer.innerHTML = '二维码生成失败';
+  }
 }
 
 console.log('🚀 Co-Editor 编辑器已启动 ');

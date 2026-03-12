@@ -22,7 +22,7 @@ async function loadDocuments() {
   listContainer.innerHTML = '<div class="loading">加载中...</div>';
 
   try {
-    const response = await fetch(apiUrl);
+    const response = await fetch(`${apiUrl}?user_id=${deviceId}`);
     const data = await response.json();
 
     if (data.success && data.documents && data.documents.length > 0) {

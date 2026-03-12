@@ -30,7 +30,7 @@ class CoEditorDB {
       }
     }
 
-    // 创建表（如果不存在）
+    // 创建文档表（如果不存在）
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS documents (
         id TEXT PRIMARY KEY,
@@ -42,13 +42,23 @@ class CoEditorDB {
         is_public INTEGER DEFAULT 1
       )
     `);
+
+    // 创建文档访问记录表（如果不存在）
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS document_access (
+        document_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        accessed_at INTEGER NOT NULL,
+        PRIMARY KEY (document_id, user_id)
+      )
+    `);
   }
 
   /**
    * 获取文档元数据 (不含内容)
    */
   getDocumentMeta(id) {
-    const row = this.db.prepare('SELECT id, created_at, updated_at, creator_id, is_public FROM documents WHERE id = ?').get(id);
+    const row = this.db.prepare('SELECT id, created_at, updated_at, creator_id, is_public, password_hash FROM documents WHERE id = ?').get(id);
     return row || null;
   }
 
@@ -135,11 +145,38 @@ class CoEditorDB {
   }
 
   /**
-   * 列出所有文档
+   * 列出用户相关的文档（创建或访问过的）
    */
-  listDocuments() {
-    const rows = this.db.prepare('SELECT id, created_at, updated_at, creator_id, is_public FROM documents ORDER BY updated_at DESC').all();
+  listDocuments(userId = null) {
+    if (!userId) {
+      // 如果没有用户 ID，返回所有文档（向后兼容）
+      const rows = this.db.prepare('SELECT id, created_at, updated_at, creator_id, is_public FROM documents ORDER BY updated_at DESC').all();
+      return rows || [];
+    }
+
+    // 查询用户创建的或访问过的文档
+    const rows = this.db.prepare(`
+      SELECT DISTINCT d.id, d.created_at, d.updated_at, d.creator_id, d.is_public
+      FROM documents d
+      LEFT JOIN document_access a ON d.id = a.document_id
+      WHERE d.creator_id = ? OR a.user_id = ?
+      ORDER BY d.updated_at DESC
+    `).all(userId, userId);
+
     return rows || [];
+  }
+
+  /**
+   * 记录文档访问
+   */
+  recordAccess(documentId, userId) {
+    const now = Date.now();
+    const stmt = this.db.prepare(`
+      INSERT OR REPLACE INTO document_access (document_id, user_id, accessed_at)
+      VALUES (?, ?, ?)
+    `);
+    stmt.run(documentId, userId, now);
+    return { success: true };
   }
 
   /**
