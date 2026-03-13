@@ -266,13 +266,14 @@ io.on('connection', (socket) => {
       return;
     }
 
-    // 操作格式: { type: 'insert|delete|set', position: 0, text: '...', timestamp: 12345 }
-    console.log(`📝 操作: ${socket.id} -> ${currentDocId}: ${JSON.stringify(data)}`);
+    // 操作格式: { type: 'insert|delete|replace|set', position: 0, text: '...', length: 0, timestamp: 12345 }
+    console.log(`📝 操作: ${socket.id} -> ${currentDocId}: type=${data.type} pos=${data.position} ${data.length ? 'len=' + data.length : ''} ${data.text ? 'text=' + JSON.stringify(data.text.substring(0, 30)) : ''}`);
 
     // 保存到数据库
     let newContent = '';
 
     if (data.type === 'set') {
+      // 不推荐使用，仅向后兼容
       newContent = data.text;
     } else {
       const currentDoc = db.getDocument(currentDocId);
@@ -286,6 +287,14 @@ io.on('connection', (socket) => {
         const before = currentContent.slice(0, data.position);
         const after = currentContent.slice(data.position + data.length);
         newContent = before + after;
+      } else if (data.type === 'replace') {
+        // 替换操作：删除一段后插入新文本
+        const before = currentContent.slice(0, data.position);
+        const after = currentContent.slice(data.position + data.length);
+        newContent = before + data.text + after;
+      } else {
+        console.log(`⚠️ 未知操作类型: ${data.type}`);
+        return;
       }
     }
 

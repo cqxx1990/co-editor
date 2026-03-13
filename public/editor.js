@@ -86,7 +86,8 @@ const state = {
   lastContent: '',
   throttleDelay: 300,
   throttleTimer: null,
-  password: null
+  password: null,
+  initialized: false  // 是否已收到服务器初始内容
 };
 
 // =============================
@@ -401,44 +402,18 @@ function renderSharedFiles() {
   // 注意：移除了事件监听器的直接绑定，改为在页面初始化时使用事件委托
 }
 
-function escapeHtml(s) {
-  return String(s || '')
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;')
-    .replaceAll("'", '&#39;');
-}
-
 /**
- * 将文本中的换行符转换为 HTML <br> 标签
- */
-function textToHtml(text) {
-  return escapeHtml(text).replace(/\n/g, '<br>') || '<br>';
-}
-
-/**
- * 将 HTML 内容转换为纯文本，<br> 转换为换行符
- */
-function htmlToText(html) {
-  // 创建临时 div 来转换
-  const div = document.createElement('div');
-  div.innerHTML = html || '';
-  return div.textContent || div.innerText || '';
-}
-
-/**
- * 获取编辑器内容作为纯文本（使用 <br> 作为换行）
+ * 获取编辑器内容
  */
 function getEditorTextContent() {
-  return htmlToText(editor.innerHTML);
+  return editor.value;
 }
 
 /**
- * 设置编辑器内容（将换行符转换为 <br>）
+ * 设置编辑器内容
  */
 function setEditorTextContent(text) {
-  editor.innerHTML = textToHtml(text);
+  editor.value = text || '';
 }
 
 function getFileItemEls(fileId) {
@@ -841,6 +816,8 @@ if (savedPassword) {
 function joinDocument(docId, password) {
   console.log('📄 加入文档:', docId, password ? '(有密码: ' + password.length + ' 字符)' : '(无密码)');
   console.log('📄 使用 user_id:', deviceId);
+  state.initialized = false;  // 重置初始化状态，等待新的 init 事件
+  editor.disabled = true;  // 禁用编辑器，等待初始化
   socket.emit('join-document', { docId, password, user_id: deviceId });
 }
 
@@ -863,6 +840,7 @@ socket.on('connect', () => {
 socket.on('disconnect', () => {
   console.log('❌ 与服务器断开连接');
   updateConnectionStatus(false);
+  state.initialized = false;  // 重置初始化状态
 });
 
 // Socket.IO v4 重连事件在 socket.io 管理器上触发
@@ -903,6 +881,9 @@ socket.on('init', (data) => {
   showEditor();
   setEditorContent(data.content);
   state.lastContent = data.content;
+  state.initialized = true;  // 标记已初始化
+  editor.disabled = false;  // 启用编辑器
+  editor.placeholder = '开始输入...';  // 更新提示文本
   updateUsersCount(data.usersCount);
 
   // 初始化文件分享 UI（需要等 editor 显示后）
@@ -1096,7 +1077,7 @@ function bindEditorEvents() {
     console.log('✍️ 输入完成');
     state.isComposing = false;
 
-    const currentContent = editor.textContent;
+    const currentContent = getEditorTextContent();
     submitContent(currentContent, true);
   });
 
@@ -1185,52 +1166,74 @@ function submitContent(content, immediate = false) {
     return;
   }
 
-  let operation = null;
-  const oldContent = state.lastContent;
+  // 防止在收到初始内容前提交（避免用空内容覆盖服务器）
+  if (!state.initialized) {
+    console.log('⚠️ 尚未初始化，暂不提交');
+    return;
+  }
 
-  if (!oldContent || content === '') {
+  const oldContent = state.lastContent || '';
+  
+  // 内容没有变化，不提交
+  if (content === oldContent) {
+    return;
+  }
+
+  let operation = null;
+
+  // 使用双端比较找出变化的精确位置
+  // 从前往后找到第一个不同的位置
+  let start = 0;
+  while (start < oldContent.length && start < content.length && oldContent[start] === content[start]) {
+    start++;
+  }
+
+  // 从后往前找到最后一个不同的位置
+  let oldEnd = oldContent.length;
+  let newEnd = content.length;
+  while (oldEnd > start && newEnd > start && oldContent[oldEnd - 1] === content[newEnd - 1]) {
+    oldEnd--;
+    newEnd--;
+  }
+
+  // 计算删除和插入的内容
+  const deletedLength = oldEnd - start;
+  const insertedText = content.slice(start, newEnd);
+
+  if (deletedLength === 0 && insertedText.length > 0) {
+    // 纯插入
     operation = {
-      type: 'set',
-      text: content,
-      position: 0,
+      type: 'insert',
+      position: start,
+      text: insertedText,
+      timestamp: Date.now()
+    };
+  } else if (deletedLength > 0 && insertedText.length === 0) {
+    // 纯删除
+    operation = {
+      type: 'delete',
+      position: start,
+      length: deletedLength,
+      timestamp: Date.now()
+    };
+  } else if (deletedLength > 0 && insertedText.length > 0) {
+    // 替换操作（先删后插）
+    operation = {
+      type: 'replace',
+      position: start,
+      length: deletedLength,
+      text: insertedText,
       timestamp: Date.now()
     };
   } else {
-    let pos = 0;
-    let i = 0;
-    while (i < oldContent.length && i < content.length && oldContent[i] === content[i]) {
-      i++;
-      pos++;
-    }
-
-    if (content.length > oldContent.length) {
-      const insertedText = content.slice(pos, pos + (content.length - oldContent.length));
-      operation = {
-        type: 'insert',
-        position: pos,
-        text: insertedText,
-        timestamp: Date.now()
-      };
-    } else if (content.length < oldContent.length) {
-      const deletedLength = oldContent.length - content.length;
-      operation = {
-        type: 'delete',
-        position: pos,
-        length: deletedLength,
-        text: '',
-        timestamp: Date.now()
-      };
-    } else {
-      operation = {
-        type: 'set',
-        text: content,
-        position: 0,
-        timestamp: Date.now()
-      };
-    }
+    // 不应该到这里，但以防万一
+    console.log('⚠️ 无法计算差异，跳过提交');
+    return;
   }
 
-  console.log('📤 提交操作:', operation);
+  console.log('📤 提交操作:', operation.type, 'pos:', operation.position, 
+              deletedLength > 0 ? 'del:' + deletedLength : '', 
+              insertedText ? 'ins:' + JSON.stringify(insertedText.substring(0, 20)) : '');
   socket.emit('operation', operation);
   state.lastContent = content;
 }
@@ -1240,6 +1243,7 @@ function applyOperation(data) {
   let newContent = '';
 
   if (data.type === 'set') {
+    // 向后兼容，但不推荐使用
     newContent = data.text;
   } else if (data.type === 'insert') {
     const before = currentContent.slice(0, data.position);
@@ -1249,92 +1253,65 @@ function applyOperation(data) {
     const before = currentContent.slice(0, data.position);
     const after = currentContent.slice(data.position + data.length);
     newContent = before + after;
+  } else if (data.type === 'replace') {
+    // 替换操作：删除一段文本后插入新文本
+    const before = currentContent.slice(0, data.position);
+    const after = currentContent.slice(data.position + data.length);
+    newContent = before + data.text + after;
+  } else {
+    console.log('⚠️ 未知操作类型:', data.type);
+    return;
   }
 
-  // 远端操作到达时，可能编辑器未聚焦/无选区，需做防御
-  const selection = window.getSelection();
-  let offset = 0;
-  if (selection && selection.rangeCount > 0) {
-    const range = selection.getRangeAt(0);
-    offset = getCaretCharacterOffsetWithin(range);
-  } else {
-    // 无选区时，尽量保持光标在末尾
-    offset = (currentContent || '').length;
+  // 保存当前光标位置并根据操作调整
+  let offset = editor.selectionStart || 0;
+  
+  // 智能调整光标位置
+  if (data.type === 'insert' && offset >= data.position) {
+    // 插入操作：如果光标在插入位置之后，需要向后偏移
+    offset += data.text.length;
+  } else if (data.type === 'delete' && offset > data.position) {
+    // 删除操作：如果光标在删除位置之后，需要向前偏移
+    if (offset <= data.position + data.length) {
+      // 光标在删除范围内，移到删除位置
+      offset = data.position;
+    } else {
+      // 光标在删除范围之后
+      offset -= data.length;
+    }
+  } else if (data.type === 'replace' && offset > data.position) {
+    // 替换操作：调整光标位置
+    if (offset <= data.position + data.length) {
+      // 光标在替换范围内，移到替换文本末尾
+      offset = data.position + data.text.length;
+    } else {
+      // 光标在替换范围之后
+      offset = offset - data.length + data.text.length;
+    }
   }
 
   setEditorContent(newContent, false);
   state.lastContent = newContent;
   updateLastSaved(data.updated_at);
 
-  setCaretPosition(Math.min(offset, newContent.length));
-}
-
-function getCaretCharacterOffsetWithin(range) {
-  const preCaretRange = range.cloneRange();
-  preCaretRange.selectNodeContents(editor);
-  preCaretRange.setEnd(range.endContainer, range.endOffset);
-  return preCaretRange.toString().length;
-}
-
-function setCaretPosition(offset) {
-  const range = document.createRange();
-  const selection = window.getSelection();
-
-  let charCount = 0;
-  let found = false;
-  const walker = document.createTreeWalker(
-    editor,
-    NodeFilter.SHOW_TEXT,
-    null,
-    false
-  );
-
-  while (walker.nextNode()) {
-    const node = walker.currentNode;
-    const nodeLength = node.length;
-
-    if (charCount + nodeLength >= offset) {
-      range.setStart(node, offset - charCount);
-      range.collapse(true);
-      found = true;
-      break;
-    }
-
-    charCount += nodeLength;
-  }
-
-  if (!found) {
-    const lastNode = editor.lastChild;
-    if (lastNode) {
-      range.setStartAfter(lastNode);
-      range.collapse(true);
-    } else {
-      range.setStart(editor, 0);
-      range.collapse(true);
-    }
-  }
-
-  selection.removeAllRanges();
-  selection.addRange(range);
+  // 恢复调整后的光标位置
+  editor.selectionStart = editor.selectionEnd = Math.min(Math.max(0, offset), newContent.length);
 }
 
 function insertTextAtCursor(text) {
-  const selection = window.getSelection();
-  if (!selection || selection.rangeCount === 0) {
-    // 没有选区时，直接追加到末尾
-    editor.innerHTML = (editor.innerHTML || '<br>') + text;
-    return;
-  }
-
-  const range = selection.getRangeAt(0);
-  range.deleteContents();
-  const textNode = document.createTextNode(text);
-  range.insertNode(textNode);
-
-  range.setStartAfter(textNode);
-  range.setEndAfter(textNode);
-  selection.removeAllRanges();
-  selection.addRange(range);
+  const start = editor.selectionStart;
+  const end = editor.selectionEnd;
+  const currentValue = editor.value;
+  
+  // 在光标位置插入文本
+  editor.value = currentValue.substring(0, start) + text + currentValue.substring(end);
+  
+  // 将光标移到插入文本的末尾
+  const newPos = start + text.length;
+  editor.selectionStart = editor.selectionEnd = newPos;
+  
+  // 聚焦编辑器
+  editor.focus();
 }
 
 function setEditorContent(content, saveSelection = true) {
@@ -1344,18 +1321,15 @@ function setEditorContent(content, saveSelection = true) {
 
   let offset = null;
   if (saveSelection) {
-    const selection = window.getSelection();
-    if (selection.rangeCount > 0) {
-      const range = selection.getRangeAt(0);
-      offset = getCaretCharacterOffsetWithin(range);
-    }
+    offset = editor.selectionStart;
   }
 
-  // 使用新的方法设置内容（支持换行）
+  // 设置新内容
   setEditorTextContent(content);
 
+  // 恢复光标位置
   if (saveSelection && offset !== null) {
-    setCaretPosition(Math.min(offset, content.length));
+    editor.selectionStart = editor.selectionEnd = Math.min(offset, content.length);
   }
 }
 
