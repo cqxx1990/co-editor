@@ -121,6 +121,13 @@ function formatBytes(bytes) {
   return `${v.toFixed(fixed)} ${units[i]}`;
 }
 
+// HTML 转义，防止 XSS
+function escapeHtml(text) {
+  const div = document.createElement('div');
+  div.textContent = text;
+  return div.innerHTML;
+}
+
 function ensureFileShareUI() {
   if (!fileDropzone || !fileListEl) return;
 
