@@ -607,6 +607,70 @@ body {
   transition: width 0.1s linear;
 }
 
+/* 续传缓存管理 */
+.resume-cache-section {
+  margin-top: 14px;
+  border: 1px solid #fff3cd;
+  border-radius: 10px;
+  padding: 12px;
+  background: #fffdf5;
+}
+
+.resume-cache-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 10px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #856404;
+}
+
+.resume-cache-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.resume-cache-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border: 1px solid #eee;
+  border-radius: 8px;
+  background: #fff;
+}
+
+.resume-cache-item__info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+
+.resume-cache-item__name {
+  font-weight: 500;
+  color: #333;
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.resume-cache-item__detail {
+  font-size: 11px;
+  color: #999;
+}
+
+.btn-sm {
+  padding: 3px 10px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
 @media (max-width: 768px) {
   .header {
     flex-direction: column;

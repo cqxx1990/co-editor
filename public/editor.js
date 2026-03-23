@@ -51,6 +51,112 @@ const pendingLocalAdds = new Map(); // clientTempId -> File
 // WebRTC 会话：key = `${fileId}:${peerSocketId}`
 const rtcSessions = new Map();
 
+// =============================
+// 断点续传
+// =============================
+// 内存 resumeStore：小文件（≤ RESUME_MEM_LIMIT）直接存内存
+const resumeStore = new Map();
+const STALL_TIMEOUT = 10000;   // 10秒无进展视为卡住
+const MAX_RESUME_RETRIES = 10; // 最大重试次数
+const RESUME_MEM_LIMIT = 50 * 1024 * 1024;  // ≤50MB 放内存
+const RESUME_IDB_EXPIRY = 24 * 60 * 60 * 1000; // IndexedDB 缓存过期：24小时
+
+// =============================
+// IndexedDB 续传缓存（大文件）
+// =============================
+const IDB_NAME = 'co-editor-resume';
+const IDB_VERSION = 1;
+const IDB_STORE = 'chunks';
+let _idb = null;
+
+function openResumeDB() {
+  if (_idb) return Promise.resolve(_idb);
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(IDB_NAME, IDB_VERSION);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(IDB_STORE)) {
+        db.createObjectStore(IDB_STORE, { keyPath: 'fileHash' });
+      }
+    };
+    req.onsuccess = () => { _idb = req.result; resolve(_idb); };
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function idbSave(entry) {
+  const db = await openResumeDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE, 'readwrite');
+    tx.objectStore(IDB_STORE).put(entry);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function idbLoad(fileHash) {
+  const db = await openResumeDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE, 'readonly');
+    const req = tx.objectStore(IDB_STORE).get(fileHash);
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function idbDelete(fileHash) {
+  const db = await openResumeDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE, 'readwrite');
+    tx.objectStore(IDB_STORE).delete(fileHash);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function idbGetAll() {
+  const db = await openResumeDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE, 'readonly');
+    const req = tx.objectStore(IDB_STORE).getAll();
+    req.onsuccess = () => resolve(req.result || []);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function idbClearAll() {
+  const db = await openResumeDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE, 'readwrite');
+    tx.objectStore(IDB_STORE).clear();
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+// 清理过期的 IndexedDB 缓存（超过 24 小时）
+async function idbCleanExpired() {
+  try {
+    const all = await idbGetAll();
+    const now = Date.now();
+    let cleaned = 0;
+    for (const entry of all) {
+      if (now - (entry.lastActive || 0) > RESUME_IDB_EXPIRY) {
+        await idbDelete(entry.fileHash);
+        cleaned++;
+      }
+    }
+    if (cleaned > 0) console.log(`[Resume] Cleaned ${cleaned} expired IndexedDB entries`);
+  } catch (e) {
+    console.warn('[Resume] Failed to clean expired entries:', e);
+  }
+}
+
+// 判断文件是用内存还是 IndexedDB
+function useIndexedDB(totalSize) {
+  return totalSize > RESUME_MEM_LIMIT;
+}
+
 const RTC_CONFIG = {
   iceServers: [
     // STUN 服务器（用于 NAT 穿透）
@@ -100,6 +206,220 @@ function formatBytes(bytes) {
   }
   const fixed = i === 0 ? 0 : (v < 10 ? 2 : 1);
   return `${v.toFixed(fixed)} ${units[i]}`;
+}
+
+// 计算文件 SHA-256 hash（大文件使用部分采样）
+async function computeFileHash(file) {
+  const MAX_FULL_HASH = 100 * 1024 * 1024; // 100MB
+  const SAMPLE = 2 * 1024 * 1024;          // 2MB
+  let data;
+  if (file.size <= MAX_FULL_HASH) {
+    data = await file.arrayBuffer();
+  } else {
+    const first = new Uint8Array(await file.slice(0, SAMPLE).arrayBuffer());
+    const last  = new Uint8Array(await file.slice(-SAMPLE).arrayBuffer());
+    const sizeBuf = new Uint8Array(8);
+    new DataView(sizeBuf.buffer).setFloat64(0, file.size);
+    const combined = new Uint8Array(first.length + last.length + 8);
+    combined.set(first, 0);
+    combined.set(last, first.length);
+    combined.set(sizeBuf, first.length + last.length);
+    data = combined.buffer;
+  }
+  const hashBuf = await crypto.subtle.digest('SHA-256', data);
+  return Array.from(new Uint8Array(hashBuf)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+// 保存断点续传进度（自动选择内存/IndexedDB）
+async function saveResumeProgress(session) {
+  const hash = session.fileHash;
+  if (!hash || !session.recv) return;
+
+  const totalSize = session.recv.expectedSize || 0;
+  const entry = {
+    fileHash: hash,
+    fileId: session.fileId,
+    received: session.recv.received,
+    totalSize,
+    name: session.recv.name,
+    mime: session.recv.mime,
+    retryCount: (session._retryCount || 0),
+    lastActive: Date.now()
+  };
+
+  if (useIndexedDB(totalSize)) {
+    // 大文件：把 chunks 合并为单个 ArrayBuffer 存 IndexedDB
+    try {
+      const merged = mergeChunks(session.recv.chunks);
+      entry.blob = merged;   // 存为 ArrayBuffer
+      entry.storage = 'idb';
+      await idbSave(entry);
+      console.log(`[Resume/IDB] Saved progress: ${formatBytes(entry.received)} / ${formatBytes(totalSize)}`);
+    } catch (e) {
+      console.error('[Resume/IDB] Failed to save:', e);
+    }
+  } else {
+    // 小文件：存内存
+    entry.chunks = session.recv.chunks.slice();
+    entry.storage = 'mem';
+    resumeStore.set(hash, entry);
+    console.log(`[Resume/Mem] Saved progress: ${formatBytes(entry.received)} / ${formatBytes(totalSize)}`);
+  }
+}
+
+// 加载断点续传进度
+async function loadResumeProgress(fileHash, totalSize) {
+  // 先查内存
+  if (resumeStore.has(fileHash)) {
+    return resumeStore.get(fileHash);
+  }
+  // 再查 IndexedDB
+  try {
+    const entry = await idbLoad(fileHash);
+    if (entry && entry.blob) {
+      // 恢复为 chunks 数组
+      entry.chunks = [entry.blob];
+      delete entry.blob;
+    }
+    return entry;
+  } catch (e) {
+    console.warn('[Resume] Failed to load from IndexedDB:', e);
+    return null;
+  }
+}
+
+// 删除断点续传进度
+async function deleteResumeProgress(fileHash) {
+  resumeStore.delete(fileHash);
+  try { await idbDelete(fileHash); } catch {}
+}
+
+// 合并 chunks 为单个 ArrayBuffer
+function mergeChunks(chunks) {
+  let total = 0;
+  for (const c of chunks) total += c.byteLength;
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const c of chunks) {
+    merged.set(new Uint8Array(c), offset);
+    offset += c.byteLength;
+  }
+  return merged.buffer;
+}
+
+// 清理会话但保留 resume 数据
+function cleanupSessionForResume(session) {
+  if (session.stallTimer) { clearInterval(session.stallTimer); session.stallTimer = null; }
+  if (session.timeoutId) { clearTimeout(session.timeoutId); session.timeoutId = null; }
+  if (session.dc) { try { session.dc.close(); } catch {} }
+  if (session.pc) { try { session.pc.close(); } catch {} }
+  rtcSessions.delete(session.key);
+}
+
+// 调度断点续传重试
+function scheduleResume(session) {
+  if (session.retryScheduled || session.completed) return;
+  session.retryScheduled = true;
+  const meta = session.meta;
+  if (!meta) return;
+  cleanupSessionForResume(session);
+
+  // 异步保存进度后再重试
+  saveResumeProgress(session).then(async () => {
+    const entry = await loadResumeProgress(session.fileHash, session.recv?.expectedSize || 0);
+    if (entry && entry.retryCount >= MAX_RESUME_RETRIES) {
+      setFileStatus(meta.fileId, `重试次数已达上限（${MAX_RESUME_RETRIES}次），请手动重新下载`, null);
+      await deleteResumeProgress(session.fileHash);
+      updateResumeCacheUI();
+      return;
+    }
+    setFileStatus(meta.fileId, '连接中断，准备断点续传...', null);
+    updateResumeCacheUI();
+    setTimeout(() => startDownload(meta), 2000);
+  });
+}
+
+// =============================
+// 续传缓存管理 UI
+// =============================
+function getResumeCacheContainer() {
+  return document.getElementById('resume-cache-section');
+}
+
+async function updateResumeCacheUI() {
+  const container = getResumeCacheContainer();
+  if (!container) return;
+
+  // 收集内存+IndexedDB 所有条目
+  const entries = [];
+
+  for (const [, v] of resumeStore) {
+    entries.push({ ...v, storage: 'mem' });
+  }
+  try {
+    const idbEntries = await idbGetAll();
+    for (const e of idbEntries) {
+      entries.push({ ...e, storage: 'idb' });
+    }
+  } catch {}
+
+  if (entries.length === 0) {
+    container.style.display = 'none';
+    return;
+  }
+
+  container.style.display = 'block';
+
+  let totalCacheSize = 0;
+  for (const e of entries) {
+    totalCacheSize += e.received || 0;
+  }
+
+  const listHtml = entries.map(e => {
+    const pct = e.totalSize ? Math.round((e.received / e.totalSize) * 100) : 0;
+    const storageLabel = e.storage === 'idb' ? '磁盘' : '内存';
+    const age = Date.now() - (e.lastActive || 0);
+    const ageText = age < 60000 ? '刚刚' : age < 3600000 ? `${Math.floor(age / 60000)}分钟前` : `${Math.floor(age / 3600000)}小时前`;
+    return `
+      <div class="resume-cache-item" data-hash="${escapeHtml(e.fileHash)}">
+        <div class="resume-cache-item__info">
+          <span class="resume-cache-item__name" title="${escapeHtml(e.name || '未知文件')}">${escapeHtml(e.name || '未知文件')}</span>
+          <span class="resume-cache-item__detail">
+            ${formatBytes(e.received)} / ${formatBytes(e.totalSize)} (${pct}%)
+            · ${storageLabel}
+            · ${ageText}
+            · 已重试 ${e.retryCount || 0} 次
+          </span>
+        </div>
+        <button class="btn btn-danger btn-sm" data-action="delete-cache" data-hash="${escapeHtml(e.fileHash)}">删除</button>
+      </div>
+    `;
+  }).join('');
+
+  container.innerHTML = `
+    <div class="resume-cache-header">
+      <span>📦 续传缓存 (${entries.length} 个文件，共 ${formatBytes(totalCacheSize)})</span>
+      <button class="btn btn-danger btn-sm" id="resume-cache-clear-all">清空全部</button>
+    </div>
+    <div class="resume-cache-list">${listHtml}</div>
+  `;
+
+  // 绑定事件
+  container.querySelector('#resume-cache-clear-all')?.addEventListener('click', async () => {
+    if (!confirm('确定清空全部续传缓存？进行中的续传将需要重新开始。')) return;
+    resumeStore.clear();
+    try { await idbClearAll(); } catch {}
+    updateResumeCacheUI();
+  });
+
+  container.querySelectorAll('[data-action="delete-cache"]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const hash = btn.dataset.hash;
+      if (!hash) return;
+      await deleteResumeProgress(hash);
+      updateResumeCacheUI();
+    });
+  });
 }
 
 function ensureFileShareUI() {
@@ -195,16 +515,25 @@ async function shareFiles(files) {
   }
 
   for (const file of files) {
-    // 为本地保存建立临时关联，等待 server 分配 fileId
     const clientTempId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
     pendingLocalAdds.set(clientTempId, file);
+
+    // 计算文件 hash 用于断点续传标识
+    let fileHash = '';
+    try {
+      fileHash = await computeFileHash(file);
+      console.log(`[Resume] File hash for ${file.name}: ${fileHash.slice(0, 16)}...`);
+    } catch (e) {
+      console.warn('[Resume] Failed to compute file hash:', e);
+    }
 
     socket.emit('file-share-add', {
       name: file.name,
       size: file.size,
       mime: file.type || 'application/octet-stream',
       ownerUserLabel: '我',
-      clientTempId
+      clientTempId,
+      hash: fileHash
     });
   }
 }
@@ -364,8 +693,17 @@ function createPeerConnection(fileId, peerSocketId, role) {
   pc.oniceconnectionstatechange = () => {
     console.log(`[WebRTC] ICE connection state for ${fileId}:`, pc.iceConnectionState);
     if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'disconnected') {
-      setFileStatus(fileId, '连接失败，请重试', null);
-      setTimeout(() => cleanupSession(key), 3000);
+      // 下载方有断点续传时，由 scheduleResume 处理重试
+      if (session.fileHash && session.role === 'downloader' && !session.completed) {
+        // 如果 data channel 从未建立过，从 ICE 层面触发重试
+        if (!session.dc || session.dc.readyState !== 'open') {
+          scheduleResume(session);
+        }
+        // 否则让 dc.onclose 处理
+      } else {
+        setFileStatus(fileId, '连接失败，请重试', null);
+        setTimeout(() => cleanupSession(key), 3000);
+      }
     } else if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
       console.log(`[WebRTC] Connection established for ${fileId}`);
     }
@@ -374,11 +712,19 @@ function createPeerConnection(fileId, peerSocketId, role) {
   pc.onconnectionstatechange = () => {
     console.log(`[WebRTC] Connection state for ${fileId}:`, pc.connectionState);
     if (pc.connectionState === 'failed') {
-      setFileStatus(fileId, '连接失败，请检查网络', null);
-      setTimeout(() => cleanupSession(key), 3000);
+      if (session.fileHash && session.role === 'downloader' && !session.completed) {
+        if (!session.dc || session.dc.readyState !== 'open') {
+          scheduleResume(session);
+        }
+      } else {
+        setFileStatus(fileId, '连接失败，请检查网络', null);
+        setTimeout(() => cleanupSession(key), 3000);
+      }
     } else if (pc.connectionState === 'disconnected') {
-      setFileStatus(fileId, '连接已断开', null);
-      setTimeout(() => cleanupSession(key), 3000);
+      if (!(session.fileHash && session.role === 'downloader')) {
+        setFileStatus(fileId, '连接已断开', null);
+        setTimeout(() => cleanupSession(key), 3000);
+      }
     }
   };
 
@@ -389,49 +735,73 @@ function createPeerConnection(fileId, peerSocketId, role) {
 async function startDownload(meta) {
   const fileId = meta.fileId;
   const owner = meta.ownerSocketId;
+  const fileHash = meta.hash || '';
   if (!owner) {
     alert('缺少文件拥有者信息');
     return;
   }
 
-  setFileStatus(fileId, '正在建立连接...', 0);
+  // 检查断点续传记录（内存+IndexedDB）
+  let resumeEntry = null;
+  if (fileHash) {
+    try {
+      resumeEntry = await loadResumeProgress(fileHash, meta.size || 0);
+    } catch (e) {
+      console.warn('[Resume] Failed to load progress:', e);
+    }
+  }
+  if (resumeEntry) {
+    if (resumeEntry.retryCount >= MAX_RESUME_RETRIES) {
+      await deleteResumeProgress(fileHash);
+      updateResumeCacheUI();
+      setFileStatus(fileId, `重试次数已达上限（${MAX_RESUME_RETRIES}次），请手动重新下载`, null);
+      return;
+    }
+    resumeEntry.retryCount++;
+    // 更新重试计数
+    if (useIndexedDB(resumeEntry.totalSize || 0)) {
+      try { await idbSave({ ...resumeEntry, blob: resumeEntry.chunks ? mergeChunks(resumeEntry.chunks) : undefined }); } catch {}
+    } else {
+      resumeStore.set(fileHash, resumeEntry);
+    }
+    const pct = resumeEntry.totalSize ? resumeEntry.received / resumeEntry.totalSize : 0;
+    setFileStatus(fileId, `断点续传（第${resumeEntry.retryCount}次重试）：已有 ${formatBytes(resumeEntry.received)}`, pct);
+    console.log(`[Resume] Resuming ${fileId}, hash=${fileHash.slice(0, 12)}..., offset=${resumeEntry.received}, retry #${resumeEntry.retryCount}`);
+  } else {
+    setFileStatus(fileId, '正在建立连接...', 0);
+  }
+
   console.log(`[WebRTC] Starting download for file: ${fileId}`);
   console.log(`[WebRTC] Connecting to owner: ${owner}`);
 
+  // 清理旧的会话
+  const oldKey = sessionKey(fileId, owner);
+  if (rtcSessions.has(oldKey)) cleanupSession(oldKey);
+
   const session = createPeerConnection(fileId, owner, 'downloader');
   const { pc } = session;
+  session.fileHash = fileHash;
+  session.meta = meta;
+  session.completed = false;
+  session.retryScheduled = false;
 
-  // 设置连接超时（60秒，给 TURN 服务器更多时间）
+  // 设置连接超时（60秒）
   const timeoutId = setTimeout(() => {
-    // 检查连接是否成功建立
     const isConnected = pc.iceConnectionState === 'connected' || 
                        pc.iceConnectionState === 'completed' ||
                        (session.dc && session.dc.readyState === 'open');
     
     if (!isConnected) {
       console.error(`[WebRTC] Connection timeout for file: ${fileId}`);
-      console.error(`[WebRTC] Final states - ICE: ${pc.iceConnectionState}, Connection: ${pc.connectionState}, ICE Gathering: ${pc.iceGatheringState}`);
-      
-      let errorMsg = '连接超时';
-      if (pc.iceGatheringState !== 'complete') {
-        errorMsg = '网络不稳定，无法收集连接信息';
-      } else if (pc.iceConnectionState === 'failed') {
-        errorMsg = '连接失败，可能需要 TURN 服务器支持';
+      if (fileHash) {
+        // 超时后自动重试
+        scheduleResume(session);
       } else {
-        errorMsg = '连接超时，请检查网络或尝试刷新页面';
+        setFileStatus(fileId, '连接超时，请检查网络或尝试刷新页面', null);
+        cleanupSession(sessionKey(fileId, owner));
       }
-      
-      setFileStatus(fileId, errorMsg, null);
-      cleanupSession(sessionKey(fileId, owner));
-      
-      // 提示用户可能的解决方案
-      console.warn('[WebRTC] 连接失败可能的原因：');
-      console.warn('1. 双方都在严格的 NAT/防火墙后');
-      console.warn('2. TURN 服务器不可用或配置错误');
-      console.warn('3. 网络不稳定');
-      console.warn('建议：尝试刷新页面或检查 TURN 服务器配置');
     }
-  }, 60000); // 延长到 60 秒
+  }, 60000);
   
   session.timeoutId = timeoutId;
   session.connectionStartTime = Date.now();
@@ -439,7 +809,7 @@ async function startDownload(meta) {
   // downloader 创建 datachannel
   const dc = pc.createDataChannel(`file:${fileId}`, { ordered: true });
   session.dc = dc;
-  wireDownloaderDataChannel(session);
+  wireDownloaderDataChannel(session, meta);
 
   try {
     const offer = await pc.createOffer();
@@ -459,53 +829,94 @@ async function startDownload(meta) {
   }
 }
 
-function wireDownloaderDataChannel(session) {
+function wireDownloaderDataChannel(session, meta) {
   const { dc, fileId } = session;
   if (!dc) return;
 
   dc.binaryType = 'arraybuffer';
 
-  dc.onopen = () => {
+  dc.onopen = async () => {
     const elapsed = session.connectionStartTime ? Date.now() - session.connectionStartTime : 0;
     console.log(`[WebRTC] Data channel opened for ${fileId} (耗时: ${Math.round(elapsed/1000)}秒)`);
-    setFileStatus(fileId, '连接已建立，等待传输...', 0);
     
-    // 清除超时定时器
     if (session.timeoutId) {
       clearTimeout(session.timeoutId);
       session.timeoutId = null;
     }
-    
-    // 记录连接类型（帮助诊断）
+
+    // 从断点续传恢复已有数据（可能来自内存或 IndexedDB）
+    const fileHash = session.fileHash;
+    let resumeEntry = null;
+    try {
+      resumeEntry = fileHash ? await loadResumeProgress(fileHash) : null;
+    } catch (e) {
+      console.warn('[Resume] Failed to load progress on channel open:', e);
+    }
+    if (resumeEntry && resumeEntry.received > 0) {
+      session.recv.chunks = resumeEntry.chunks ? resumeEntry.chunks.slice() : [];
+      session.recv.received = resumeEntry.received;
+      session.recv.expectedSize = resumeEntry.totalSize || null;
+      session.recv.name = resumeEntry.name || session.recv.name;
+      session.recv.mime = resumeEntry.mime || session.recv.mime;
+      session._retryCount = resumeEntry.retryCount || 0;
+      console.log(`[Resume] Restored progress: ${formatBytes(resumeEntry.received)} already received`);
+    }
+
+    const offset = session.recv.received || 0;
+
+    // 告知上传方从哪个偏移开始发送
+    dc.send(JSON.stringify({ type: 'request', offset }));
+
+    if (offset > 0) {
+      const pct = session.recv.expectedSize ? offset / session.recv.expectedSize : 0;
+      setFileStatus(fileId, `断点续传：从 ${formatBytes(offset)} 继续`, pct);
+    } else {
+      setFileStatus(fileId, '连接已建立，等待传输...', 0);
+    }
+
+    // 启动卡住检测（10秒无进展则重试）
+    session.recv.lastProgressTime = Date.now();
+    session.stallTimer = setInterval(() => {
+      const elapsed = Date.now() - (session.recv.lastProgressTime || Date.now());
+      if (session.recv.received > 0 && elapsed > STALL_TIMEOUT && !session.completed) {
+        console.warn(`[Resume] Transfer stalled for ${Math.round(elapsed / 1000)}s, retrying...`);
+        scheduleResume(session);
+      }
+    }, 2000);
+
+    // 记录连接类型
     setTimeout(() => {
+      if (!session.pc) return;
       session.pc.getStats().then(stats => {
         stats.forEach(report => {
           if (report.type === 'candidate-pair' && report.state === 'succeeded') {
-            const localCandidate = stats.get(report.localCandidateId);
-            const remoteCandidate = stats.get(report.remoteCandidateId);
-            if (localCandidate && remoteCandidate) {
-              console.log(`[WebRTC] Connection type: ${localCandidate.candidateType} -> ${remoteCandidate.candidateType}`);
-              if (localCandidate.candidateType === 'relay' || remoteCandidate.candidateType === 'relay') {
-                console.log('[WebRTC] 使用 TURN 中继连接');
-              } else if (localCandidate.candidateType === 'srflx' || remoteCandidate.candidateType === 'srflx') {
-                console.log('[WebRTC] 使用 STUN 穿透连接');
-              } else {
-                console.log('[WebRTC] 使用直接连接');
-              }
+            const lc = stats.get(report.localCandidateId);
+            const rc = stats.get(report.remoteCandidateId);
+            if (lc && rc) {
+              console.log(`[WebRTC] Connection type: ${lc.candidateType} -> ${rc.candidateType}`);
             }
           }
         });
-      }).catch(e => console.warn('[WebRTC] 无法获取连接统计:', e));
+      }).catch(() => {});
     }, 1000);
   };
   
   dc.onerror = (error) => {
     console.error(`[WebRTC] Data channel error for ${fileId}:`, error);
-    setFileStatus(fileId, '数据通道错误', null);
+    if (session.fileHash && !session.completed) {
+      scheduleResume(session);
+    } else {
+      setFileStatus(fileId, '数据通道错误', null);
+    }
   };
   
   dc.onclose = () => {
     console.log(`[WebRTC] Data channel closed for ${fileId}`);
+    // 未完成的传输自动续传
+    if (session.fileHash && !session.completed && session.recv.received > 0 &&
+        session.recv.received < (session.recv.expectedSize || Infinity)) {
+      scheduleResume(session);
+    }
   };
 
   dc.onmessage = (ev) => {
@@ -516,8 +927,12 @@ function wireDownloaderDataChannel(session) {
           session.recv.expectedSize = msg.size;
           session.recv.mime = msg.mime || 'application/octet-stream';
           session.recv.name = msg.name || 'download';
-          setFileStatus(fileId, `开始接收：0 / ${formatBytes(msg.size)}`, 0);
+          // received & chunks 保持现有值（续传或新的 0）
+          const progress = msg.size ? session.recv.received / msg.size : 0;
+          setFileStatus(fileId, `接收中：${formatBytes(session.recv.received)} / ${formatBytes(msg.size)}`, progress);
+          session.recv.lastProgressTime = Date.now();
         } else if (msg.type === 'done') {
+          session.completed = true;
           finalizeDownload(session);
         }
       } catch {
@@ -526,17 +941,19 @@ function wireDownloaderDataChannel(session) {
       return;
     }
 
-    // binary
+    // binary chunk
     const buf = ev.data;
     if (buf && buf.byteLength) {
       session.recv.chunks.push(buf);
       session.recv.received += buf.byteLength;
+      session.recv.lastProgressTime = Date.now();
 
       const total = session.recv.expectedSize || 0;
       const p = total ? (session.recv.received / total) : null;
       setFileStatus(fileId, `接收中：${formatBytes(session.recv.received)} / ${formatBytes(total)}`, p);
 
       if (total && session.recv.received >= total) {
+        session.completed = true;
         finalizeDownload(session);
       }
     }
@@ -548,6 +965,17 @@ function finalizeDownload(session) {
   const { chunks, mime, name, expectedSize } = session.recv;
 
   console.log(`[WebRTC] Finalizing download for ${fileId}`);
+
+  // 清除卡住检测
+  if (session.stallTimer) { clearInterval(session.stallTimer); session.stallTimer = null; }
+
+  // 清除断点续传记录（内存+IndexedDB）
+  if (session.fileHash) {
+    deleteResumeProgress(session.fileHash).then(() => {
+      console.log(`[Resume] Cleared resume data for ${session.fileHash.slice(0, 12)}...`);
+      updateResumeCacheUI();
+    }).catch(() => {});
+  }
   
   const blob = new Blob(chunks, { type: mime || 'application/octet-stream' });
   const url = URL.createObjectURL(blob);
@@ -587,67 +1015,89 @@ function wireUploaderDataChannel(session) {
     console.log(`[WebRTC] Uploader data channel closed for ${fileId}`);
   };
 
-  dc.onopen = async () => {
+  dc.onopen = () => {
     const elapsed = session.connectionStartTime ? Date.now() - session.connectionStartTime : 0;
     console.log(`[WebRTC] Uploader data channel opened for ${fileId} (耗时: ${Math.round(elapsed/1000)}秒)`);
     
-    // 清除超时定时器（如果有）
     if (session.timeoutId) {
       clearTimeout(session.timeoutId);
       session.timeoutId = null;
     }
-    
-    const file = localFiles.get(fileId);
-    if (!file) {
-      console.error(`[WebRTC] Local file missing for ${fileId}`);
-      setFileStatus(fileId, '本机文件缺失，无法发送', null);
-      try { dc.close(); } catch {}
-      return;
-    }
 
+    // 等待下载方发送 request 消息后再开始传输
+    setFileStatus(fileId, '等待下载方确认...', 0);
+  };
+
+  // 接收下载方的 request 消息（含断点偏移）
+  dc.onmessage = async (ev) => {
+    if (typeof ev.data !== 'string') return;
     try {
-      // 先发 meta
-      dc.send(JSON.stringify({
-        type: 'meta',
-        name: file.name,
-        size: file.size,
-        mime: file.type || 'application/octet-stream'
-      }));
-
-      // 分片发送
-      const chunkSize = 64 * 1024;
-      let offset = 0;
-
-      setFileStatus(fileId, `发送给 ${peerSocketId.slice(0, 6)}：0 / ${formatBytes(file.size)}`, 0);
-
-      while (offset < file.size) {
-        const slice = file.slice(offset, offset + chunkSize);
-        const buf = await slice.arrayBuffer();
-
-        // 简单流控：避免 send buffer 堵塞
-        while (dc.bufferedAmount > 4 * 1024 * 1024) {
-          await new Promise((r) => setTimeout(r, 50));
+      const msg = JSON.parse(ev.data);
+      if (msg.type === 'request') {
+        const startOffset = msg.offset || 0;
+        if (startOffset > 0) {
+          console.log(`[Resume] Uploader: resuming from offset ${formatBytes(startOffset)}`);
         }
-
-        dc.send(buf);
-        offset += buf.byteLength;
-        setFileStatus(fileId, `发送给 ${peerSocketId.slice(0, 6)}：${formatBytes(offset)} / ${formatBytes(file.size)}`, offset / file.size);
+        await sendFileFromOffset(session, startOffset);
       }
-
-      dc.send(JSON.stringify({ type: 'done' }));
-      console.log(`[WebRTC] File transfer complete for ${fileId}`);
-      setFileStatus(fileId, `发送完成：${formatBytes(file.size)}`, 1);
-      
-      // 延迟关闭，确保对方收到 done 消息
-      setTimeout(() => {
-        try { dc.close(); } catch {}
-      }, 1000);
-    } catch (error) {
-      console.error(`[WebRTC] Error during file transfer:`, error);
-      setFileStatus(fileId, `发送失败：${error.message}`, null);
-      try { dc.close(); } catch {}
+    } catch (e) {
+      console.error('[WebRTC] Error handling request:', e);
     }
   };
+}
+
+async function sendFileFromOffset(session, startOffset) {
+  const { fileId, peerSocketId, dc } = session;
+  const file = localFiles.get(fileId);
+  if (!file) {
+    console.error(`[WebRTC] Local file missing for ${fileId}`);
+    setFileStatus(fileId, '本机文件缺失，无法发送', null);
+    try { dc.close(); } catch {}
+    return;
+  }
+
+  try {
+    // 发送 meta 信息
+    dc.send(JSON.stringify({
+      type: 'meta',
+      name: file.name,
+      size: file.size,
+      mime: file.type || 'application/octet-stream',
+      resumeOffset: startOffset
+    }));
+
+    const chunkSize = 64 * 1024;
+    let offset = startOffset;
+    const label = peerSocketId.slice(0, 6);
+
+    setFileStatus(fileId, `发送给 ${label}：${formatBytes(offset)} / ${formatBytes(file.size)}`, offset / file.size);
+
+    while (offset < file.size) {
+      const slice = file.slice(offset, offset + chunkSize);
+      const buf = await slice.arrayBuffer();
+
+      // 流控：避免 send buffer 堵塞
+      while (dc.bufferedAmount > 4 * 1024 * 1024) {
+        await new Promise((r) => setTimeout(r, 50));
+      }
+
+      dc.send(buf);
+      offset += buf.byteLength;
+      setFileStatus(fileId, `发送给 ${label}：${formatBytes(offset)} / ${formatBytes(file.size)}`, offset / file.size);
+    }
+
+    dc.send(JSON.stringify({ type: 'done' }));
+    console.log(`[WebRTC] File transfer complete for ${fileId}`);
+    setFileStatus(fileId, `发送完成：${formatBytes(file.size)}`, 1);
+    
+    setTimeout(() => {
+      try { dc.close(); } catch {}
+    }, 1000);
+  } catch (error) {
+    console.error(`[WebRTC] Error during file transfer:`, error);
+    setFileStatus(fileId, `发送失败：${error.message}`, null);
+    try { dc.close(); } catch {}
+  }
 }
 
 // 尝试从 sessionStorage 获取密码
@@ -721,6 +1171,9 @@ socket.on('init', (data) => {
 
   // 初始化文件分享 UI（需要等 editor 显示后）
   ensureFileShareUI();
+
+  // 初始化续传缓存 UI 及清理过期缓存
+  idbCleanExpired().then(() => updateResumeCacheUI()).catch(() => {});
 });
 
 // 文件分享：全量列表
