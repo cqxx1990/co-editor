@@ -332,7 +332,7 @@ io.on('connection', (socket) => {
   // WebRTC 文件分享：新增共享文件（只存元数据）
   socket.on('file-share-add', (payload) => {
     if (!currentDocId || !currentRoom) return;
-    const { name, path, displayName, size, mime, ownerUserLabel, clientTempId, isFolder } = payload || {};
+    const { name, path, displayName, size, mime, ownerUserLabel, clientTempId, isFolder, hash } = payload || {};
     if (!name || typeof size !== 'number') return;
 
     const fileId = crypto.randomBytes(12).toString('hex');
@@ -347,6 +347,7 @@ io.on('connection', (socket) => {
       ownerUserLabel: ownerUserLabel || '',
       clientTempId: clientTempId || null,
       isFolder: isFolder || false,  // 是否包含文件夹结构
+      hash: hash || '',
       createdAt: Date.now(),
       docId: currentDocId
     };
