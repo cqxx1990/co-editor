@@ -896,6 +896,18 @@ async function startDownload(meta) {
     return;
   }
 
+  // 防止重复点击：如果已经有活跃的下载会话，且连接状态正常，则忽略
+  const existingKey = sessionKey(fileId, owner);
+  const existingSession = rtcSessions.get(existingKey);
+  if (existingSession && existingSession.role === 'downloader' && !existingSession.completed && !existingSession.retryScheduled) {
+    const dcState = existingSession.dc?.readyState;
+    const pcState = existingSession.pc?.iceConnectionState;
+    if (dcState === 'open' || dcState === 'connecting' || pcState === 'new' || pcState === 'checking' || pcState === 'connected') {
+      console.log(`[WebRTC] Download already in progress for ${fileId}, ignoring duplicate click`);
+      return;
+    }
+  }
+
   // 检查断点续传记录（内存+IndexedDB）
   let resumeEntry = null;
   if (fileHash) {
@@ -1398,6 +1410,13 @@ socket.on('webrtc-signal', async (payload) => {
 
       console.log(`[WebRTC] Received offer for ${fileId} from ${from}`);
       
+      // 清理已有的上传会话，防止重复 offer 导致并行上传
+      const existingSession = rtcSessions.get(key);
+      if (existingSession) {
+        console.warn(`[WebRTC] Cleaning up existing uploader session for ${fileId} from ${from}`);
+        cleanupSession(key);
+      }
+
       const session = createPeerConnection(fileId, from, 'uploader');
       const { pc } = session;
       session.connectionStartTime = Date.now();
