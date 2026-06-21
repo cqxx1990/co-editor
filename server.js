@@ -359,6 +359,47 @@ io.on('connection', (socket) => {
     io.to(currentRoom).emit('file-share-added', meta);
   });
 
+  // 文件夹分享：一次性提交所有文件元数据
+  socket.on('file-share-add-folder', (payload) => {
+    if (!currentDocId || !currentRoom) return;
+    const { name, files, clientTempId } = payload || {};
+    if (!name || !Array.isArray(files) || !files.length) return;
+
+    const folderId = crypto.randomBytes(12).toString('hex');
+    const fileEntries = files.map(f => ({
+      fileId: crypto.randomBytes(12).toString('hex'),
+      path: f.path,
+      name: String(f.path).split('/').pop() || f.path,
+      size: typeof f.size === 'number' ? f.size : 0,
+      mime: f.mime || 'application/octet-stream',
+      hash: f.hash || ''
+    }));
+
+    const meta = {
+      folderId,
+      type: 'folder',
+      name,
+      files: fileEntries,
+      totalSize: fileEntries.reduce((s, f) => s + f.size, 0),
+      ownerSocketId: socket.id,
+      clientTempId: clientTempId || null,
+      createdAt: Date.now(),
+      docId: currentDocId
+    };
+
+    const shareMap = getFileShareMap(currentDocId);
+    shareMap.set(folderId, meta);
+    for (const fe of fileEntries) {
+      shareMap.set(fe.fileId, {
+        fileId: fe.fileId, name: fe.name, path: fe.path, displayName: fe.path,
+        size: fe.size, mime: fe.mime, hash: fe.hash,
+        folderId, ownerSocketId: socket.id, docId: currentDocId, createdAt: meta.createdAt
+      });
+    }
+
+    io.to(currentRoom).emit('file-share-folder-added', meta);
+  });
+
   socket.on('file-share-remove', (payload) => {
     if (!currentDocId || !currentRoom) return;
     const { fileId } = payload || {};
@@ -368,11 +409,16 @@ io.on('connection', (socket) => {
     const meta = shareMap.get(fileId);
     if (!meta) return;
 
-    // 仅拥有者可删除
     if (meta.ownerSocketId !== socket.id) return;
 
     shareMap.delete(fileId);
-    io.to(currentRoom).emit('file-share-removed', { fileId });
+    // 文件夹：同时删除所有子文件条目
+    if (meta.type === 'folder' && meta.files) {
+      for (const f of meta.files) shareMap.delete(f.fileId);
+      io.to(currentRoom).emit('file-share-removed', { folderId: fileId });
+    } else {
+      io.to(currentRoom).emit('file-share-removed', { fileId });
+    }
   });
 
   // WebRTC 信令转发：to 为目标 socket.id

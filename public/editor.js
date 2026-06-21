@@ -190,7 +190,7 @@ if (!docId) {
 const state = {
   isComposing: false,
   lastContent: '',
-  throttleDelay: 300,
+  throttleDelay: 1500,
   throttleTimer: null,
   password: null,
   initialized: false  // 是否已收到服务器初始内容
@@ -210,6 +210,7 @@ const sharedFiles = new Map(); // fileId -> meta
 // 本机实际文件（仅拥有者保存，用于发送）
 const localFiles = new Map(); // fileId -> File
 const pendingLocalAdds = new Map(); // clientTempId -> File
+const pendingLocalFolderAdds = new Map(); // clientTempId -> { name, files: File[] }
 
 // WebRTC 会话：key = `${fileId}:${peerSocketId}`
 const rtcSessions = new Map();
@@ -461,40 +462,90 @@ function ensureFileShareUI() {
     });
   }
 
-  // Drag & drop
-  const setDrag = (on) => {
-    fileDropzone.classList.toggle('dragover', !!on);
-  };
+  // 文件夹选择
+  const folderPickBtn = document.getElementById('folder-pick-btn');
+  const folderPicker = document.getElementById('folder-picker');
+  if (folderPickBtn && folderPicker) {
+    folderPickBtn.addEventListener('click', () => folderPicker.click());
+    folderPicker.addEventListener('change', async (e) => {
+      const files = Array.from(e.target.files || []);
+      folderPicker.value = '';
+      if (!files.length) return;
+      // 从 webkitRelativePath 还原文件夹名和路径
+      const folderName = files[0].webkitRelativePath.split('/')[0];
+      await shareFolderFromFiles(folderName, files.map(f => {
+        f._folderPath = f.webkitRelativePath.replace(/^[^/]+\//, '');
+        return f;
+      }));
+    });
+  }
 
-  fileDropzone.addEventListener('dragover', (e) => {
-    e.preventDefault();
-    setDrag(true);
-  });
+  // Drag & drop
+  const setDrag = (on) => fileDropzone.classList.toggle('dragover', !!on);
+
+  fileDropzone.addEventListener('dragover', (e) => { e.preventDefault(); setDrag(true); });
   fileDropzone.addEventListener('dragleave', () => setDrag(false));
   fileDropzone.addEventListener('drop', async (e) => {
     e.preventDefault();
     setDrag(false);
 
-    const files = await extractFilesFromDataTransfer(e.dataTransfer);
-    if (files.length) await shareFiles(files);
+    const items = Array.from(e.dataTransfer?.items || []);
+    const dirEntries = items
+      .map(it => it.webkitGetAsEntry?.())
+      .filter(entry => entry?.isDirectory);
+
+    if (dirEntries.length) {
+      for (const entry of dirEntries) await shareFolderFromEntry(entry);
+      // 非文件夹的文件也处理
+      const fileItems = items.filter(it => it.kind === 'file' && !it.webkitGetAsEntry?.()?.isDirectory);
+      if (fileItems.length) await shareFiles(fileItems.map(it => it.getAsFile()).filter(Boolean));
+    } else {
+      const files = await extractFilesFromDataTransfer(e.dataTransfer);
+      if (files.length) await shareFiles(files);
+    }
   });
 
-  // 使用事件委托处理文件列表点击（避免重复绑定）
+  // 文件列表点击委托
   fileListEl.addEventListener('click', async (e) => {
     const btn = e.target.closest('button');
     if (!btn) return;
 
     const action = btn.dataset.action;
+
+    // 文件夹操作
+    const folderItem = btn.closest('.folder-share-item');
+    if (folderItem) {
+      const folderId = folderItem.dataset.folderId;
+      if (action === 'remove-folder' && folderId) {
+        socket.emit('file-share-remove', { fileId: folderId });
+      } else if (action === 'download-folder' && folderId) {
+        const meta = sharedFiles.get(folderId);
+        if (meta?.files) {
+          for (const f of meta.files) {
+            const fileMeta = sharedFiles.get(f.fileId) || { ...f, ownerSocketId: meta.ownerSocketId };
+            await startDownload(fileMeta);
+          }
+        }
+      } else if (action === 'toggle-folder' && folderId) {
+        const body = folderItem.querySelector('.folder-share-body');
+        const arrow = btn.querySelector('.folder-arrow') || btn;
+        if (body) {
+          const open = body.style.display !== 'none';
+          body.style.display = open ? 'none' : 'block';
+          btn.textContent = (open ? '▶ ' : '▼ ') + folderItem.dataset.folderName;
+        }
+      }
+      return;
+    }
+
+    // 普通文件操作
     const fileItem = btn.closest('.file-item');
     const fileId = fileItem?.dataset?.fileId;
-
     if (action === 'remove' && fileId) {
       socket.emit('file-share-remove', { fileId });
     } else if (action === 'download' && fileId) {
       const meta = sharedFiles.get(fileId);
-      if (meta) {
-        await startDownload(meta);
-      }
+      if (meta) await startDownload(meta);
     }
   });
 }
@@ -594,6 +645,43 @@ async function shareFiles(files) {
       hash: fileHash
     });
   }
+}
+
+async function shareFolderFromEntry(dirEntry) {
+  const files = [];
+  const walkEntry = async (entry, path) => {
+    if (entry.isFile) {
+      await new Promise(resolve => entry.file(f => { f._folderPath = path + f.name; files.push(f); resolve(); }, resolve));
+    } else if (entry.isDirectory) {
+      const reader = entry.createReader();
+      const readBatch = async () => {
+        const entries = await new Promise(res => reader.readEntries(res));
+        if (!entries?.length) return;
+        for (const child of entries) await walkEntry(child, path + entry.name + '/');
+        await readBatch();
+      };
+      await readBatch();
+    }
+  };
+  await walkEntry(dirEntry, '');
+  await shareFolderFromFiles(dirEntry.name, files);
+}
+
+async function shareFolderFromFiles(folderName, files) {
+  if (!socket || !socket.connected) { alert('未连接服务器，无法分享文件夹'); return; }
+  if (!files.length) return;
+
+  const clientTempId = `folder-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  pendingLocalFolderAdds.set(clientTempId, { name: folderName, files });
+
+  const filesMeta = await Promise.all(files.map(async f => ({
+    path: f._folderPath || f.webkitRelativePath || f.name,
+    size: f.size,
+    mime: f.type || 'application/octet-stream',
+    hash: await computeFileHash(f).catch(() => '')
+  })));
+
+  socket.emit('file-share-add-folder', { name: folderName, files: filesMeta, clientTempId });
 }
 
 /**
@@ -723,19 +811,66 @@ function getFileIcon(mimeType) {
 function renderSharedFiles() {
   if (!fileListEl) return;
 
-  const files = Array.from(sharedFiles.values()).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-  if (!files.length) {
+  const allEntries = Array.from(sharedFiles.values()).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+  if (!allEntries.length) {
     fileListEl.innerHTML = '<div class="loading" style="padding: 10px;">暂无共享文件</div>';
     return;
   }
 
-  // 构建文件树并渲染
-  const tree = buildFileTree(files);
-  const treeHtml = renderFileTree(tree);
+  const folders = allEntries.filter(e => e.type === 'folder');
+  const plainFiles = allEntries.filter(e => e.type !== 'folder' && !e.folderId); // exclude folder-child entries
 
-  fileListEl.innerHTML = treeHtml;
+  let html = '';
 
-  // 注意：移除了事件监听器的直接绑定，改为在页面初始化时使用事件委托
+  // 渲染文件夹
+  for (const folder of folders) {
+    const isOwner = folder.ownerSocketId === socket.id;
+    html += renderFolderEntry(folder, isOwner);
+  }
+
+  // 渲染普通文件（使用现有树渲染）
+  if (plainFiles.length) {
+    const tree = buildFileTree(plainFiles);
+    html += renderFileTree(tree);
+  }
+
+  fileListEl.innerHTML = html;
+}
+
+function renderFolderEntry(folder, isOwner) {
+  const fileRows = (folder.files || []).map(f => {
+    const icon = getFileIcon(f.mime);
+    return `
+      <div class="file-item" data-file-id="${escapeHtml(f.fileId)}" style="padding-left:16px">
+        <div class="file-item__meta">
+          <div class="file-item__name" title="${escapeHtml(f.path)}">${icon} ${escapeHtml(f.name || f.path.split('/').pop())}</div>
+          <div class="file-item__sub">${escapeHtml(f.path)} · ${formatBytes(f.size)}</div>
+          <div class="progress" style="display:none"><div></div></div>
+          <div class="file-item__sub file-item__status" style="display:none"></div>
+        </div>
+        <div class="file-item__actions">
+          <button class="btn btn-primary" data-action="download">下载</button>
+        </div>
+      </div>`;
+  }).join('');
+
+  return `
+    <div class="folder-share-item" data-folder-id="${escapeHtml(folder.folderId)}" data-folder-name="${escapeHtml(folder.name)}">
+      <div class="file-item">
+        <div class="file-item__meta" style="flex:1">
+          <button class="btn btn-secondary" data-action="toggle-folder" style="text-align:left;width:100%">
+            ▶ 📁 ${escapeHtml(folder.name)}
+            <span style="font-size:12px;color:#888;margin-left:8px">${folder.files?.length || 0} 个文件 · ${formatBytes(folder.totalSize)}</span>
+          </button>
+        </div>
+        <div class="file-item__actions">
+          ${isOwner
+            ? `<button class="btn btn-danger" data-action="remove-folder">移除</button>`
+            : `<button class="btn btn-secondary" data-action="download-folder">全部下载</button>`}
+        </div>
+      </div>
+      <div class="folder-share-body" style="display:none">${fileRows}</div>
+    </div>`;
 }
 
 /**
@@ -1271,8 +1406,8 @@ async function sendFileFromOffset(session, startOffset) {
   }
 }
 
-// 尝试从 sessionStorage 获取密码
-const savedPassword = sessionStorage.getItem(`doc-password-${docId}`);
+// 尝试从 localStorage 获取密码（按文档 ID 单独存储）
+const savedPassword = localStorage.getItem(`doc-password-${docId}`);
 
 // 不立即加入文档，等待 socket 连接成功后再加入
 if (savedPassword) {
@@ -1294,7 +1429,7 @@ socket.on('connect', () => {
   updateConnectionStatus(true);
 
   // 连接成功后加入文档
-  const savedPassword = state.password || sessionStorage.getItem(`doc-password-${docId}`);
+  const savedPassword = state.password || localStorage.getItem(`doc-password-${docId}`);
   if (savedPassword) {
     console.log('🔑 使用保存的密码加入文档');
     joinDocument(docId, savedPassword);
@@ -1360,11 +1495,15 @@ socket.on('init', (data) => {
   idbCleanExpired().then(() => updateResumeCacheUI()).catch(() => {});
 });
 
-// 文件分享：全量列表
+// 文件分享：全量列表（含普通文件和文件夹）
 socket.on('file-share-list', (payload) => {
   sharedFiles.clear();
   for (const f of (payload?.files || [])) {
-    if (f?.fileId) sharedFiles.set(f.fileId, f);
+    if (f?.folderId && f?.type === 'folder') {
+      sharedFiles.set(f.folderId, f);
+    } else if (f?.fileId) {
+      sharedFiles.set(f.fileId, f);
+    }
   }
   renderSharedFiles();
 });
@@ -1384,10 +1523,40 @@ socket.on('file-share-added', (meta) => {
   renderSharedFiles();
 });
 
-socket.on('file-share-removed', ({ fileId }) => {
-  if (!fileId) return;
-  sharedFiles.delete(fileId);
-  localFiles.delete(fileId);
+socket.on('file-share-removed', ({ fileId, folderId }) => {
+  if (folderId) {
+    const meta = sharedFiles.get(folderId);
+    if (meta?.files) meta.files.forEach(f => { sharedFiles.delete(f.fileId); localFiles.delete(f.fileId); });
+    sharedFiles.delete(folderId);
+  } else if (fileId) {
+    sharedFiles.delete(fileId);
+    localFiles.delete(fileId);
+  }
+  renderSharedFiles();
+});
+
+// 文件夹分享：新增
+socket.on('file-share-folder-added', (meta) => {
+  if (!meta?.folderId) return;
+  sharedFiles.set(meta.folderId, meta);
+  // 单独存储每个子文件，便于 WebRTC 下载查询 ownerSocketId
+  for (const f of (meta.files || [])) {
+    sharedFiles.set(f.fileId, { ...f, ownerSocketId: meta.ownerSocketId, folderId: meta.folderId });
+  }
+
+  if (meta.ownerSocketId === socket.id && meta.clientTempId) {
+    const folderData = pendingLocalFolderAdds.get(meta.clientTempId);
+    if (folderData) {
+      pendingLocalFolderAdds.delete(meta.clientTempId);
+      const pathToFileId = new Map(meta.files.map(f => [f.path, f.fileId]));
+      for (const file of folderData.files) {
+        const filePath = file._folderPath || file.webkitRelativePath || file.name;
+        const fileId = pathToFileId.get(filePath);
+        if (fileId) localFiles.set(fileId, file);
+      }
+    }
+  }
+
   renderSharedFiles();
 });
 
@@ -1527,7 +1696,7 @@ socket.on('error', (data) => {
     document.getElementById('password-input').focus();
 
     // 清除保存的错误密码
-    sessionStorage.removeItem(`doc-password-${docId}`);
+    localStorage.removeItem(`doc-password-${docId}`);
     state.password = null;
 
     console.log('🗑️  已清除保存的密码');
@@ -1569,13 +1738,28 @@ function bindEditorEvents() {
     }
   });
 
-  // 粘贴事件
-  editor.addEventListener('paste', (e) => {
-    e.preventDefault();
+  // 粘贴事件：图片 → 文件分享；文本 → 插入编辑器
+  editor.addEventListener('paste', async (e) => {
+    const items = Array.from(e.clipboardData?.items || []);
+    const imageFiles = items
+      .filter(i => i.kind === 'file' && i.type.startsWith('image/'))
+      .map(i => {
+        const file = i.getAsFile();
+        if (!file) return null;
+        const ext = i.type.split('/')[1] || 'png';
+        return new File([file], `screenshot-${Date.now()}.${ext}`, { type: i.type });
+      })
+      .filter(Boolean);
 
+    if (imageFiles.length) {
+      e.preventDefault();
+      await shareFiles(imageFiles);
+      return;
+    }
+
+    e.preventDefault();
     const text = (e.clipboardData || window.clipboardData).getData('text/plain');
     insertTextAtCursor(text);
-
     const currentContent = getEditorTextContent();
     submitContent(currentContent, true);
   });
@@ -1609,10 +1793,35 @@ function bindEditorEvents() {
       return;
     }
 
+    const saveMode = document.querySelector('input[name="pwd-save"]:checked')?.value || 'remember';
     state.password = password;
-    sessionStorage.setItem(`doc-password-${docId}`, password);
+    if (saveMode === 'remember') {
+      localStorage.setItem(`doc-password-${docId}`, password);
+    }
 
     joinDocument(docId, password);
+  });
+
+  // 非编辑器焦点时，粘贴文件/图片 → 文件分享
+  document.addEventListener('paste', async (e) => {
+    if (document.activeElement === editor) return;
+    const items = Array.from(e.clipboardData?.items || []);
+    const files = items
+      .filter(i => i.kind === 'file')
+      .map(i => {
+        const file = i.getAsFile();
+        if (!file) return null;
+        if (i.type.startsWith('image/')) {
+          const ext = i.type.split('/')[1] || 'png';
+          return new File([file], `screenshot-${Date.now()}.${ext}`, { type: i.type });
+        }
+        return file;
+      })
+      .filter(Boolean);
+    if (files.length) {
+      e.preventDefault();
+      await shareFiles(files);
+    }
   });
 
   // 分享模态框 - 点击外部关闭
